@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import time
 from typing import TYPE_CHECKING, Any
 import urllib.error
 import urllib.request
 
 from loguru import logger
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    InvalidToken,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -93,6 +104,46 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+@dataclass
+class PendingSend:
+    """Persisted outbound Telegram message waiting for retry."""
+
+    message_id: str
+    chat_id: str
+    text: str
+    parse_mode: str | None
+    created_at: float
+    attempts: int
+    next_retry_at: float
+    last_error: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "message_id": self.message_id,
+            "chat_id": self.chat_id,
+            "text": self.text,
+            "parse_mode": self.parse_mode,
+            "created_at": self.created_at,
+            "attempts": self.attempts,
+            "next_retry_at": self.next_retry_at,
+            "last_error": self.last_error,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PendingSend":
+        now = time.time()
+        return cls(
+            message_id=str(raw.get("message_id") or f"legacy-{int(now * 1000)}"),
+            chat_id=str(raw.get("chat_id") or ""),
+            text=str(raw.get("text") or ""),
+            parse_mode=(str(raw.get("parse_mode")) if raw.get("parse_mode") is not None else None),
+            created_at=float(raw.get("created_at") or now),
+            attempts=int(raw.get("attempts") or 0),
+            next_retry_at=float(raw.get("next_retry_at") or now),
+            last_error=str(raw.get("last_error") or ""),
+        )
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling.
@@ -129,6 +180,14 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._pending_exec_confirms: set[tuple[str, str]] = set()  # (chat_id, task_id)
         self._workspace_path = str(Path.home() / ".nanobot" / "workspace")
+        self._outbox_path = Path(self.config.send_retry_outbox_path).expanduser()
+        self._outbox: list[PendingSend] = []
+        self._outbox_lock = asyncio.Lock()
+        self._retry_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._api_available: bool | None = None
+        self._dropped_counts_by_chat: dict[str, int] = {}
+        self._send_seq = 0
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -183,6 +242,18 @@ class TelegramChannel(BaseChannel):
             allowed_updates=["message", "callback_query"],
             drop_pending_updates=self.config.drop_pending_updates
         )
+
+        if self.config.send_retry_enabled:
+            await self._load_outbox()
+            self._retry_task = asyncio.create_task(self._retry_worker(), name="telegram-retry-worker")
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_worker(),
+                name="telegram-heartbeat-worker",
+            )
+            logger.info(
+                "Telegram retry enabled "
+                f"(queue={len(self._outbox)}, heartbeat={self.config.send_retry_heartbeat_seconds}s)"
+            )
         
         # Keep running until stopped
         while self._running:
@@ -191,6 +262,14 @@ class TelegramChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop the Telegram bot."""
         self._running = False
+
+        await self._stop_background_task(self._retry_task)
+        self._retry_task = None
+        await self._stop_background_task(self._heartbeat_task)
+        self._heartbeat_task = None
+
+        if self.config.send_retry_enabled:
+            await self._save_outbox()
         
         # Cancel all typing indicators
         for chat_id in list(self._typing_tasks):
@@ -214,30 +293,350 @@ class TelegramChannel(BaseChannel):
         text_content = (msg.content or "").strip()
         if not text_content:
             text_content = "抱歉，这次回复为空。请再发一次，我马上重试。"
-        
+
         try:
-            # chat_id should be the Telegram chat ID (integer)
-            chat_id = int(msg.chat_id)
-            # Convert markdown to Telegram HTML
-            html_content = _markdown_to_telegram_html(text_content)
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=html_content,
-                parse_mode="HTML"
-            )
+            chat_id = str(int(msg.chat_id))
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
+            return
+
+        message_id = self._new_message_id(chat_id)
+        try:
+            await self._send_message_with_fallback(chat_id, text_content)
+            self._api_available = True
+            return
         except Exception as e:
-            # Fallback to plain text if HTML parsing fails
-            logger.warning(f"HTML parse failed, falling back to plain text: {e}")
-            try:
-                await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id),
-                    text=text_content
+            retryable = self._is_retryable_error(e)
+            if retryable:
+                self._api_available = False
+            if not self.config.send_retry_enabled or not retryable:
+                logger.error(
+                    "Error sending Telegram message (not queued): "
+                    f"message_id={message_id}, chat_id={chat_id}, retryable={retryable}, error={e}"
                 )
-            except Exception as e2:
-                logger.error(f"Error sending Telegram message: {e2}")
-    
+                return
+
+            await self._enqueue_pending(
+                PendingSend(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    text=text_content,
+                    parse_mode="HTML",
+                    created_at=time.time(),
+                    attempts=0,
+                    next_retry_at=time.time() + max(1, int(self.config.send_retry_initial_seconds)),
+                    last_error=str(e),
+                )
+            )
+            logger.warning(
+                "queued_for_retry "
+                f"message_id={message_id}, chat_id={chat_id}, error={e}"
+            )
+
+    async def _stop_background_task(self, task: asyncio.Task | None) -> None:
+        """Cancel and await a background task safely."""
+        if not task:
+            return
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Background task stopped with error: {e}")
+
+    async def _send_message_with_fallback(self, chat_id: str, text: str) -> None:
+        """Try HTML first, then fallback to plain text."""
+        if not self._app:
+            raise RuntimeError("Telegram app not running")
+        html_content = _markdown_to_telegram_html(text)
+        try:
+            await self._app.bot.send_message(
+                chat_id=int(chat_id),
+                text=html_content,
+                parse_mode="HTML",
+            )
+            return
+        except Exception as html_error:
+            logger.warning(
+                "HTML parse failed, falling back to plain text: "
+                f"chat_id={chat_id}, error={html_error}"
+            )
+        await self._app.bot.send_message(chat_id=int(chat_id), text=text)
+
+    def _new_message_id(self, chat_id: str) -> str:
+        """Generate a local unique message id for outbox tracking."""
+        self._send_seq += 1
+        return f"{int(time.time() * 1000)}-{chat_id}-{self._send_seq}"
+
+    def _is_retryable_error(self, err: Exception) -> bool:
+        """Decide whether a send error should enter retry queue."""
+        if isinstance(err, (TimedOut, NetworkError, RetryAfter, urllib.error.URLError)):
+            return True
+        if isinstance(err, (BadRequest, Forbidden, InvalidToken)):
+            return False
+        if isinstance(err, TelegramError):
+            text = str(err).lower()
+            retry_hints = (
+                "timed out",
+                "timeout",
+                "temporarily unavailable",
+                "service unavailable",
+                "internal server error",
+                "bad gateway",
+                "gateway timeout",
+                "too many requests",
+            )
+            return any(hint in text for hint in retry_hints)
+        return False
+
+    def _retry_after_seconds(self, err: Exception) -> float | None:
+        """Extract retry-after seconds when provider asks for cooldown."""
+        if not isinstance(err, RetryAfter):
+            return None
+        raw = err.retry_after
+        if hasattr(raw, "total_seconds"):
+            try:
+                return max(1.0, float(raw.total_seconds()))
+            except Exception:
+                return None
+        try:
+            return max(1.0, float(raw))
+        except Exception:
+            return None
+
+    async def _enqueue_pending(self, pending: PendingSend) -> None:
+        """Append outbound message to retry queue and persist to disk."""
+        dropped_chat_id: str | None = None
+        async with self._outbox_lock:
+            self._outbox.append(pending)
+            if len(self._outbox) > max(1, int(self.config.send_retry_max_queue)):
+                dropped = self._outbox.pop(0)
+                dropped_chat_id = dropped.chat_id
+                self._dropped_counts_by_chat[dropped.chat_id] = self._dropped_counts_by_chat.get(dropped.chat_id, 0) + 1
+            await self._save_outbox_locked()
+        if dropped_chat_id:
+            logger.warning(
+                "retry queue overflow, dropped oldest message "
+                f"chat_id={dropped_chat_id}, limit={self.config.send_retry_max_queue}"
+            )
+
+    async def _load_outbox(self) -> None:
+        """Load persisted retry queue from disk."""
+        path = self._outbox_path
+        if not path.exists():
+            return
+        try:
+            raw_text = await asyncio.to_thread(path.read_text, encoding="utf-8")
+            raw_data = json.loads(raw_text)
+            if not isinstance(raw_data, list):
+                raise ValueError("outbox file must be a JSON list")
+            loaded: list[PendingSend] = []
+            for item in raw_data:
+                if isinstance(item, dict):
+                    loaded.append(PendingSend.from_dict(item))
+            async with self._outbox_lock:
+                self._outbox = loaded
+            logger.info(f"Loaded Telegram retry outbox: {len(loaded)} message(s)")
+        except Exception as e:
+            logger.error(f"Failed to load Telegram outbox {path}: {e}")
+
+    async def _save_outbox(self) -> None:
+        """Persist retry queue to disk."""
+        async with self._outbox_lock:
+            await self._save_outbox_locked()
+
+    async def _save_outbox_locked(self) -> None:
+        """Persist retry queue to disk; caller must hold _outbox_lock."""
+        path = self._outbox_path
+        payload = [item.to_dict() for item in self._outbox]
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            tmp.replace(path)
+
+        await asyncio.to_thread(_write)
+
+    def _is_expired(self, pending: PendingSend, now_ts: float) -> bool:
+        """Check whether queued message exceeded TTL."""
+        ttl = max(1, int(self.config.send_retry_ttl_seconds))
+        return (now_ts - pending.created_at) > ttl
+
+    async def _drop_expired_locked(self, now_ts: float) -> int:
+        """Drop expired pending messages; caller must hold _outbox_lock."""
+        keep: list[PendingSend] = []
+        dropped_total = 0
+        for pending in self._outbox:
+            if self._is_expired(pending, now_ts):
+                dropped_total += 1
+                self._dropped_counts_by_chat[pending.chat_id] = self._dropped_counts_by_chat.get(pending.chat_id, 0) + 1
+            else:
+                keep.append(pending)
+        if dropped_total:
+            self._outbox = keep
+            await self._save_outbox_locked()
+        return dropped_total
+
+    async def _flush_outbox(self, *, force: bool) -> None:
+        """Retry queued messages, optionally ignoring next_retry_at."""
+        if not self._app:
+            return
+        async with self._outbox_lock:
+            now_ts = time.time()
+            dropped = await self._drop_expired_locked(now_ts)
+            if dropped:
+                logger.warning(f"Dropped {dropped} expired Telegram message(s) from retry outbox")
+            due = [
+                item
+                for item in self._outbox
+                if force or item.next_retry_at <= now_ts
+            ]
+
+        if not due:
+            if self._api_available:
+                await self._send_expired_summary_if_needed()
+            return
+
+        for pending in due:
+            if not self._running:
+                return
+            try:
+                await self._send_message_with_fallback(pending.chat_id, pending.text)
+                self._api_available = True
+                removed = await self._remove_pending(pending.message_id)
+                if removed:
+                    logger.info(
+                        "retry_success "
+                        f"message_id={pending.message_id}, chat_id={pending.chat_id}, attempts={pending.attempts}"
+                    )
+            except Exception as e:
+                retryable = self._is_retryable_error(e)
+                if retryable:
+                    self._api_available = False
+                handled = await self._reschedule_or_drop_pending(
+                    message_id=pending.message_id,
+                    error=e,
+                    retryable=retryable,
+                )
+                if handled:
+                    logger.warning(
+                        "retry_failed "
+                        f"message_id={pending.message_id}, chat_id={pending.chat_id}, retryable={retryable}, error={e}"
+                    )
+
+        if self._api_available:
+            await self._send_expired_summary_if_needed()
+
+    async def _remove_pending(self, message_id: str) -> bool:
+        """Remove one pending message by message_id."""
+        async with self._outbox_lock:
+            original_len = len(self._outbox)
+            self._outbox = [item for item in self._outbox if item.message_id != message_id]
+            if len(self._outbox) == original_len:
+                return False
+            await self._save_outbox_locked()
+            return True
+
+    async def _reschedule_or_drop_pending(self, message_id: str, error: Exception, retryable: bool) -> bool:
+        """Update retry schedule (or drop) for one message id."""
+        async with self._outbox_lock:
+            now_ts = time.time()
+            target: PendingSend | None = None
+            for item in self._outbox:
+                if item.message_id == message_id:
+                    target = item
+                    break
+            if target is None:
+                return False
+
+            if self._is_expired(target, now_ts):
+                self._outbox = [item for item in self._outbox if item.message_id != message_id]
+                self._dropped_counts_by_chat[target.chat_id] = self._dropped_counts_by_chat.get(target.chat_id, 0) + 1
+                await self._save_outbox_locked()
+                return True
+
+            if not retryable:
+                self._outbox = [item for item in self._outbox if item.message_id != message_id]
+                await self._save_outbox_locked()
+                return True
+
+            target.attempts += 1
+            initial = max(1, int(self.config.send_retry_initial_seconds))
+            max_wait = max(initial, int(self.config.send_retry_max_seconds))
+            delay = min(initial * (2 ** max(target.attempts - 1, 0)), max_wait)
+            retry_after = self._retry_after_seconds(error)
+            if retry_after is not None:
+                delay = max(delay, retry_after)
+            target.next_retry_at = now_ts + delay
+            target.last_error = str(error)
+            await self._save_outbox_locked()
+            return True
+
+    async def _send_expired_summary_if_needed(self) -> None:
+        """Send one recovery summary per chat for TTL-expired dropped messages."""
+        if not self._app or not self._dropped_counts_by_chat:
+            return
+        sent_chat_ids: list[str] = []
+        for chat_id, count in list(self._dropped_counts_by_chat.items()):
+            if count <= 0:
+                sent_chat_ids.append(chat_id)
+                continue
+            text = f"离线期间有 {count} 条回复超过24小时未送达，已丢弃。"
+            try:
+                await self._app.bot.send_message(chat_id=int(chat_id), text=text)
+                sent_chat_ids.append(chat_id)
+                logger.info(
+                    "expired_dropped_summary_sent "
+                    f"chat_id={chat_id}, dropped_count={count}"
+                )
+            except Exception as e:
+                if self._is_retryable_error(e):
+                    self._api_available = False
+                    logger.warning(f"Failed to send dropped summary (will retry later): {e}")
+                    return
+                logger.warning(f"Failed to send dropped summary (discarded): {e}")
+                sent_chat_ids.append(chat_id)
+        for chat_id in sent_chat_ids:
+            self._dropped_counts_by_chat.pop(chat_id, None)
+
+    async def _check_telegram_api(self) -> bool:
+        """Probe Telegram API health using get_me."""
+        if not self._app:
+            return False
+        try:
+            await self._app.bot.get_me()
+            return True
+        except Exception:
+            return False
+
+    async def _heartbeat_worker(self) -> None:
+        """Periodically probe Telegram API and flush queue on recovery."""
+        interval = max(1, int(self.config.send_retry_heartbeat_seconds))
+        while self._running:
+            is_up = await self._check_telegram_api()
+            prev = self._api_available
+            self._api_available = is_up
+            if is_up and prev is False:
+                logger.info("heartbeat_up")
+                await self._flush_outbox(force=True)
+            elif not is_up and prev is not False:
+                logger.warning("heartbeat_down")
+            await asyncio.sleep(interval)
+
+    async def _retry_worker(self) -> None:
+        """Retry queued outbound messages based on retry schedule."""
+        while self._running:
+            try:
+                await self._flush_outbox(force=False)
+            except Exception as e:
+                logger.error(f"Retry worker error: {e}")
+            await asyncio.sleep(1)
+
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
         if not update.message or not update.effective_user:

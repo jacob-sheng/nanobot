@@ -25,6 +25,13 @@ class TelegramConfig(BaseModel):
     plan_bridge_buttons_enabled: bool = True  # Show PlanBridge inline buttons from listener
     plan_bridge_auto_bind_natural_language: bool = True  # Auto-bind plain text replies to single open needs_input task
     plan_bridge_require_execute_confirm: bool = True  # Require second tap before creating execution task
+    send_retry_enabled: bool = True  # Persist failed outbound messages and retry when Telegram API recovers
+    send_retry_initial_seconds: int = 5  # Initial retry interval in seconds
+    send_retry_max_seconds: int = 300  # Maximum retry interval in seconds
+    send_retry_heartbeat_seconds: int = 30  # Health-check interval for Telegram API
+    send_retry_ttl_seconds: int = 86400  # Drop unsent messages after TTL seconds
+    send_retry_outbox_path: str = "~/.nanobot/state/telegram_outbox.json"  # Outbox persistence file
+    send_retry_max_queue: int = 1000  # Maximum number of pending outbound messages
 
 
 class FeishuConfig(BaseModel):
