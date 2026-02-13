@@ -163,6 +163,8 @@ class TelegramChannel(BaseChannel):
         BotCommand("plan_run", "Run a ready plan"),
         BotCommand("plan_cancel", "Cancel plan execution"),
         BotCommand("task_status", "Query Codex task status"),
+        BotCommand("task_mode", "Set one-time task permission"),
+        BotCommand("run_mode", "Alias of /task_mode"),
     ]
     
     def __init__(
@@ -179,7 +181,8 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
-        self._pending_exec_confirms: set[tuple[str, str]] = set()  # (chat_id, task_id)
+        self._pending_exec_confirms: dict[tuple[str, str], str] = {}  # (chat_id, task_id) -> sandbox
+        self._task_mode_tokens: dict[str, tuple[str, float]] = {}  # chat_id -> (sandbox, expires_at)
         self._workspace_path = str(Path.home() / ".nanobot" / "workspace")
         self._outbox_path = Path(self.config.send_retry_outbox_path).expanduser()
         self._outbox: list[PendingSend] = []
@@ -220,6 +223,8 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("plan_run", self._on_plan_run))
         self._app.add_handler(CommandHandler("plan_cancel", self._on_plan_cancel))
         self._app.add_handler(CommandHandler("task_status", self._on_task_status))
+        self._app.add_handler(CommandHandler("task_mode", self._on_task_mode))
+        self._app.add_handler(CommandHandler("run_mode", self._on_task_mode))
         self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
 
         # Add message handler for text, photos, voice, documents
@@ -689,13 +694,60 @@ class TelegramChannel(BaseChannel):
             "/start — Start the bot\n"
             "/reset — Reset conversation history\n"
             "/help — Show this help message\n"
-            "/plan_reply & /plan-reply — Reply to PlanBridge questions\n"
-            "/plan_run & /plan-run — Execute a ready plan\n"
-            "/plan_cancel & /plan-cancel — Cancel a pending plan run\n"
+            "/plan_reply & /plan-reply — Reply to PlanBridge (no arg shows picker)\n"
+            "/plan_run & /plan-run — Execute ready plan (no arg shows picker)\n"
+            "/plan_cancel & /plan-cancel — Cancel task (no arg shows picker)\n"
             "/task_status & /task-status — Query task status\n\n"
+            "/task_mode & /task-mode — Set one-time run mode (sandbox/full)\n"
+            "/run_mode & /run-mode — Alias of /task_mode\n\n"
+            "Plan run now requires mode selection (sandbox/full) before execution.\n"
+            "Tip: reply to a Codex-Listener notification message to auto-bind its task.\n\n"
             "Just send me a text message to chat!"
         )
         await update.message.reply_text(help_text, parse_mode="HTML")
+
+    def _parse_sandbox_mode(self, raw: str | None) -> str | None:
+        """Normalize user-provided run mode to listener sandbox value."""
+        if not raw:
+            return None
+        value = raw.strip().lower()
+        if value in {"sandbox", "ws", "workspace", "workspace-write", "workspace_write"}:
+            return "workspace-write"
+        if value in {"full", "full-access", "danger", "danger-full-access", "danger_full_access"}:
+            return "danger-full-access"
+        return None
+
+    def _sandbox_mode_label(self, sandbox: str) -> str:
+        """Human-readable mode label."""
+        if sandbox == "danger-full-access":
+            return "Full Access"
+        return "Sandbox"
+
+    def _get_task_mode_token(self, chat_id: int | str) -> str | None:
+        """Get one-time task mode token if still valid."""
+        key = str(chat_id)
+        token = self._task_mode_tokens.get(key)
+        if not token:
+            return None
+        sandbox, expires_at = token
+        if time.time() >= expires_at:
+            self._task_mode_tokens.pop(key, None)
+            return None
+        return sandbox
+
+    def _consume_task_mode_token(self, chat_id: int | str) -> str | None:
+        """Consume one-time task mode token."""
+        key = str(chat_id)
+        sandbox = self._get_task_mode_token(key)
+        if sandbox is None:
+            return None
+        self._task_mode_tokens.pop(key, None)
+        return sandbox
+
+    def _set_task_mode_token(self, chat_id: int | str, sandbox: str) -> None:
+        """Set one-time task mode token with TTL."""
+        ttl = max(1, int(self.config.task_mode_token_ttl_seconds))
+        self._task_mode_tokens[str(chat_id)] = (sandbox, time.time() + ttl)
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
@@ -722,6 +774,18 @@ class TelegramChannel(BaseChannel):
                 text=message.text,
             ):
                 return
+
+            # If user replies to a Codex-Listener notification, auto-bind by task_id.
+            if (
+                not message.text.strip().startswith("/")
+                and not (message.photo or message.voice or message.audio or message.document)
+            ):
+                if await self._maybe_bind_plan_reply_from_reply_message(
+                    update=update,
+                    sender_id=sender_id,
+                    text=message.text.strip(),
+                ):
+                    return
 
             # Optional auto-bind for plain text replies when exactly one needs_input task is open.
             if (
@@ -797,6 +861,21 @@ class TelegramChannel(BaseChannel):
                 content_parts.append(f"[{media_type}: download failed]")
         
         content = "\n".join(content_parts) if content_parts else "[empty message]"
+
+        if (
+            self.config.task_mode_soft_gate_enabled
+            and message.text
+            and not message.text.strip().startswith("/")
+            and not (message.photo or message.voice or message.audio or message.document)
+        ):
+            sandbox = self._consume_task_mode_token(chat_id)
+            if sandbox:
+                guidance = (
+                    "【本轮任务权限偏好】\n"
+                    f"如果你需要通过 Codex-Listener 提交执行任务，必须显式使用 sandbox={sandbox}。\n"
+                    "若权限不匹配，请先提示用户重新选择 /task-mode。"
+                )
+                content = f"{guidance}\n\n用户消息：{content}"
         
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
         
@@ -828,12 +907,20 @@ class TelegramChannel(BaseChannel):
         if not self.is_allowed(sender_id):
             await update.message.reply_text("未授权用户，无法执行该操作。")
             return
+        if len(context.args) == 0:
+            await self._reply_plan_picker(update.message.chat_id, mode="reply")
+            return
         if len(context.args) < 2:
-            await update.message.reply_text("用法：/plan-reply <task_id> <你的回答>")
+            await update.message.reply_text("用法：/plan-reply <task_id> <你的回答>\n或直接输入 /plan-reply 选择任务")
             return
         task_id = context.args[0].strip()
         answer = " ".join(context.args[1:]).strip()
-        await self._submit_plan_reply(update.message.chat_id, task_id, answer)
+        await self._submit_plan_reply(
+            update.message.chat_id,
+            task_id,
+            answer,
+            allow_bridge_none=True,
+        )
 
     async def _on_plan_run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /plan_run command."""
@@ -843,10 +930,19 @@ class TelegramChannel(BaseChannel):
         if not self.is_allowed(sender_id):
             await update.message.reply_text("未授权用户，无法执行该操作。")
             return
-        if len(context.args) < 1:
-            await update.message.reply_text("用法：/plan-run <task_id>")
+        if len(context.args) == 0:
+            await self._reply_plan_picker(update.message.chat_id, mode="run")
             return
-        await self._submit_plan_run(update.message.chat_id, context.args[0].strip())
+        task_id = context.args[0].strip()
+        mode_arg = context.args[1].strip() if len(context.args) >= 2 else None
+        sandbox = self._parse_sandbox_mode(mode_arg)
+        if mode_arg and not sandbox:
+            await update.message.reply_text("用法：/plan-run <task_id> <sandbox|full>\n或直接输入 /plan-run 选择任务")
+            return
+        if not sandbox and self.config.plan_bridge_run_mode_required:
+            await self._reply_plan_run_mode_picker(update.message.chat_id, task_id)
+            return
+        await self._start_plan_run_confirm(update.message.chat_id, task_id, sandbox or "workspace-write")
 
     async def _on_plan_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /plan_cancel command."""
@@ -856,8 +952,11 @@ class TelegramChannel(BaseChannel):
         if not self.is_allowed(sender_id):
             await update.message.reply_text("未授权用户，无法执行该操作。")
             return
+        if len(context.args) == 0:
+            await self._reply_plan_picker(update.message.chat_id, mode="cancel")
+            return
         if len(context.args) < 1:
-            await update.message.reply_text("用法：/plan-cancel <task_id>")
+            await update.message.reply_text("用法：/plan-cancel <task_id>\n或直接输入 /plan-cancel 选择任务")
             return
         await self._cancel_task(update.message.chat_id, context.args[0].strip())
 
@@ -879,6 +978,28 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text(f"查询失败：{e}")
             return
         await update.message.reply_text(self._format_task_status(task))
+
+    async def _on_task_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /task_mode and /run_mode command."""
+        if not update.message or not update.effective_user:
+            return
+        sender_id = self._sender_id(update.effective_user.id, update.effective_user.username)
+        if not self.is_allowed(sender_id):
+            await update.message.reply_text("未授权用户，无法执行该操作。")
+            return
+        if len(context.args) == 0:
+            await self._reply_task_mode_picker(update.message.chat_id)
+            return
+        sandbox = self._parse_sandbox_mode(context.args[0])
+        if not sandbox:
+            await update.message.reply_text("用法：/task-mode <sandbox|full>\n或直接输入 /task-mode 选择按钮")
+            return
+        self._set_task_mode_token(update.message.chat_id, sandbox)
+        ttl = max(1, int(self.config.task_mode_token_ttl_seconds))
+        await update.message.reply_text(
+            f"已设置本次任务权限：{self._sandbox_mode_label(sandbox)}（{sandbox}）。\n"
+            f"仅下一条普通任务消息生效，{ttl} 秒后过期。"
+        )
 
     async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle PlanBridge action buttons from codex-listener messages."""
@@ -908,44 +1029,85 @@ class TelegramChannel(BaseChannel):
         await query.answer()
 
         if action == "exec":
-            if self.config.plan_bridge_require_execute_confirm:
-                self._pending_exec_confirms.add((chat_id, task_id))
-                keyboard = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton("✅ 确认执行", callback_data=f"pb1|exec_confirm|{task_id}"),
-                            InlineKeyboardButton("❎ 取消", callback_data=f"pb1|exec_abort|{task_id}"),
-                        ]
-                    ]
-                )
-                if query.message:
-                    await query.message.reply_text(
-                        f"请二次确认是否执行计划（task_id={task_id}）。",
-                        reply_markup=keyboard,
-                    )
+            if self.config.plan_bridge_run_mode_required:
+                await self._reply_plan_run_mode_picker(chat_id, task_id)
                 return
-            await self._submit_plan_run(chat_id, task_id)
+            await self._start_plan_run_confirm(chat_id, task_id, "workspace-write")
             return
 
-        if action == "exec_confirm":
-            if self.config.plan_bridge_require_execute_confirm and (chat_id, task_id) not in self._pending_exec_confirms:
+        if action == "mode_ws":
+            await self._start_plan_run_confirm(chat_id, task_id, "workspace-write")
+            return
+
+        if action == "mode_full":
+            await self._start_plan_run_confirm(chat_id, task_id, "danger-full-access")
+            return
+
+        if action in {"exec_confirm", "exec_confirm_ws", "exec_confirm_full"}:
+            key = (chat_id, task_id)
+            sandbox = self._pending_exec_confirms.get(key)
+            requested_sandbox = sandbox
+            if action == "exec_confirm_ws":
+                requested_sandbox = "workspace-write"
+            elif action == "exec_confirm_full":
+                requested_sandbox = "danger-full-access"
+            if not requested_sandbox:
                 if query.message:
                     await query.message.reply_text("确认态已失效，请重新点击“执行计划”。")
                 return
-            self._pending_exec_confirms.discard((chat_id, task_id))
-            await self._submit_plan_run(chat_id, task_id)
+            if self.config.plan_bridge_require_execute_confirm:
+                if sandbox != requested_sandbox:
+                    if query.message:
+                        await query.message.reply_text("确认态已失效，请重新选择执行权限。")
+                    return
+            self._pending_exec_confirms.pop(key, None)
+            await self._submit_plan_run(chat_id, task_id, requested_sandbox)
             return
 
         if action == "exec_abort":
-            self._pending_exec_confirms.discard((chat_id, task_id))
+            self._pending_exec_confirms.pop((chat_id, task_id), None)
             if query.message:
                 await query.message.reply_text(f"已取消执行（task_id={task_id}）。")
             return
 
         if action == "cancel":
-            self._pending_exec_confirms.discard((chat_id, task_id))
+            self._pending_exec_confirms.pop((chat_id, task_id), None)
             if query.message:
                 await query.message.reply_text(f"已记录取消，不会执行该计划（task_id={task_id}）。")
+            return
+
+        if action == "cancel_task":
+            await self._cancel_task(chat_id, task_id)
+            return
+
+        if action == "setmode_ws":
+            self._set_task_mode_token(chat_id, "workspace-write")
+            ttl = max(1, int(self.config.task_mode_token_ttl_seconds))
+            if query.message:
+                await query.message.reply_text(
+                    f"已设置本次任务权限：Sandbox（workspace-write）。\n仅下一条普通任务消息生效，{ttl} 秒后过期。"
+                )
+            return
+
+        if action == "setmode_full":
+            self._set_task_mode_token(chat_id, "danger-full-access")
+            ttl = max(1, int(self.config.task_mode_token_ttl_seconds))
+            if query.message:
+                await query.message.reply_text(
+                    f"已设置本次任务权限：Full Access（danger-full-access）。\n"
+                    f"仅下一条普通任务消息生效，{ttl} 秒后过期。"
+                )
+            return
+
+        if action == "status":
+            try:
+                task = await self._listener_get_json(f"/tasks/{task_id}")
+            except RuntimeError as e:
+                if query.message:
+                    await query.message.reply_text(f"查询失败：{e}")
+                return
+            if query.message:
+                await query.message.reply_text(self._format_task_status(task))
             return
 
     async def _maybe_handle_plan_text_command(
@@ -963,7 +1125,7 @@ class TelegramChannel(BaseChannel):
             return False
 
         m = re.match(
-            r"^/(plan-reply|plan_run|plan-run|plan_cancel|plan-cancel|task-status|task_status|plan_reply)\b(?:@\w+)?\s*(.*)$",
+            r"^/(plan-reply|plan_run|plan-run|plan_cancel|plan-cancel|task-status|task_status|plan_reply|task-mode|task_mode|run-mode|run_mode)\b(?:@\w+)?\s*(.*)$",
             raw,
             flags=re.IGNORECASE,
         )
@@ -978,23 +1140,41 @@ class TelegramChannel(BaseChannel):
         rest = (m.group(2) or "").strip()
 
         if cmd == "plan-reply":
+            if not rest:
+                await self._reply_plan_picker(update.message.chat_id, mode="reply")
+                return True
             parts = rest.split(maxsplit=1)
             if len(parts) < 2:
-                await update.message.reply_text("用法：/plan-reply <task_id> <你的回答>")
+                await update.message.reply_text("用法：/plan-reply <task_id> <你的回答>\n或直接输入 /plan-reply 选择任务")
                 return True
-            await self._submit_plan_reply(update.message.chat_id, parts[0].strip(), parts[1].strip())
+            await self._submit_plan_reply(
+                update.message.chat_id,
+                parts[0].strip(),
+                parts[1].strip(),
+                allow_bridge_none=True,
+            )
             return True
 
         if cmd == "plan-run":
             if not rest:
-                await update.message.reply_text("用法：/plan-run <task_id>")
+                await self._reply_plan_picker(update.message.chat_id, mode="run")
                 return True
-            await self._submit_plan_run(update.message.chat_id, rest.split(maxsplit=1)[0].strip())
+            parts = rest.split()
+            task_id = parts[0].strip()
+            mode_arg = parts[1].strip() if len(parts) >= 2 else None
+            sandbox = self._parse_sandbox_mode(mode_arg)
+            if mode_arg and not sandbox:
+                await update.message.reply_text("用法：/plan-run <task_id> <sandbox|full>\n或直接输入 /plan-run 选择任务")
+                return True
+            if not sandbox and self.config.plan_bridge_run_mode_required:
+                await self._reply_plan_run_mode_picker(update.message.chat_id, task_id)
+                return True
+            await self._start_plan_run_confirm(update.message.chat_id, task_id, sandbox or "workspace-write")
             return True
 
         if cmd == "plan-cancel":
             if not rest:
-                await update.message.reply_text("用法：/plan-cancel <task_id>")
+                await self._reply_plan_picker(update.message.chat_id, mode="cancel")
                 return True
             await self._cancel_task(update.message.chat_id, rest.split(maxsplit=1)[0].strip())
             return True
@@ -1010,6 +1190,22 @@ class TelegramChannel(BaseChannel):
                 await update.message.reply_text(f"查询失败：{e}")
                 return True
             await update.message.reply_text(self._format_task_status(task))
+            return True
+
+        if cmd in {"task-mode", "run-mode"}:
+            if not rest:
+                await self._reply_task_mode_picker(update.message.chat_id)
+                return True
+            sandbox = self._parse_sandbox_mode(rest.split(maxsplit=1)[0].strip())
+            if not sandbox:
+                await update.message.reply_text("用法：/task-mode <sandbox|full>\n或直接输入 /task-mode 选择按钮")
+                return True
+            self._set_task_mode_token(update.message.chat_id, sandbox)
+            ttl = max(1, int(self.config.task_mode_token_ttl_seconds))
+            await update.message.reply_text(
+                f"已设置本次任务权限：{self._sandbox_mode_label(sandbox)}（{sandbox}）。\n"
+                f"仅下一条普通任务消息生效，{ttl} 秒后过期。"
+            )
             return True
 
         return False
@@ -1049,29 +1245,102 @@ class TelegramChannel(BaseChannel):
         await self._submit_plan_reply(update.message.chat_id, task_id, text)
         return True
 
-    async def _submit_plan_reply(self, chat_id: int | str, task_id: str, answer: str) -> None:
-        """Create a plan_bridge child task by replying to needs_input."""
+    def _extract_task_id_from_notification_text(self, text: str | None) -> str | None:
+        """Extract short task_id from Codex-Listener notification text."""
+        if not text:
+            return None
+        m = re.search(r"\bTask\s+([0-9a-f]{8})\b", text, flags=re.IGNORECASE)
+        if not m:
+            return None
+        return m.group(1).lower()
+
+    async def _maybe_bind_plan_reply_from_reply_message(
+        self,
+        update: Update,
+        sender_id: str,
+        text: str,
+    ) -> bool:
+        """Auto-handle plain replies to Codex-Listener notification messages."""
+        if not update.message or not text:
+            return False
+        if not self.is_allowed(sender_id):
+            return False
+
+        replied = update.message.reply_to_message
+        if not replied:
+            return False
+        source_text = replied.text or replied.caption or ""
+        task_id = self._extract_task_id_from_notification_text(source_text)
+        if not task_id:
+            return False
+
+        try:
+            parent = await self._listener_get_json(f"/tasks/{task_id}")
+        except RuntimeError as e:
+            await self._reply_text(update.message.chat_id, f"读取被回复任务失败：{e}")
+            return True
+
+        if str(parent.get("workflow_mode") or "") != "plan_bridge":
+            return False
+        await self._submit_plan_reply(
+            update.message.chat_id,
+            task_id,
+            text,
+            allow_bridge_none=True,
+        )
+        return True
+
+    async def _submit_plan_reply(
+        self,
+        chat_id: int | str,
+        task_id: str,
+        answer: str,
+        *,
+        allow_bridge_none: bool = False,
+    ) -> None:
+        """Create a plan_bridge child task by replying to needs_input (or none fallback)."""
         try:
             parent = await self._listener_get_json(f"/tasks/{task_id}")
         except RuntimeError as e:
             await self._reply_text(chat_id, f"读取任务失败：{e}")
             return
 
-        if parent.get("bridge_stage") != "needs_input":
-            await self._reply_text(chat_id, f"任务 {task_id} 当前不是 needs_input 阶段。")
+        if str(parent.get("workflow_mode") or "") != "plan_bridge":
+            await self._reply_text(chat_id, f"任务 {task_id} 不是 plan_bridge 任务。")
+            return
+        stage = str(parent.get("bridge_stage") or "none").strip().lower()
+        if stage != "needs_input":
+            if not (allow_bridge_none and stage == "none"):
+                await self._reply_text(chat_id, f"任务 {task_id} 当前不是 needs_input 阶段。")
+                return
+            logger.warning(
+                f"plan reply fallback enabled for task {task_id} (bridge_stage=none)"
+            )
+        if not answer.strip():
+            await self._reply_text(chat_id, "回答不能为空。")
             return
         session_id = str(parent.get("session_id") or "").strip()
         if not session_id:
             await self._reply_text(chat_id, f"任务 {task_id} 缺少 session_id，无法 resume。")
             return
 
-        prompt = (
-            "用户已回答上一轮澄清问题。请继续 PlanBridge。\n"
-            "要求：如果还需要信息，输出 planmode.v1 needs_input JSON；"
-            "如果信息充分，输出 planmode.v1 plan_ready JSON。\n"
-            "禁止执行实现。\n\n"
-            f"用户回答：{answer}"
-        )
+        if stage == "none":
+            prompt = (
+                "上一轮输出未携带标准 planmode.v1 状态包。"
+                "请根据历史上下文和本轮用户回复继续 PlanBridge。\n"
+                "要求：若仍缺信息，必须输出 planmode.v1 needs_input JSON；"
+                "若信息充分，必须输出 planmode.v1 plan_ready JSON。\n"
+                "禁止执行实现，禁止只给普通文本总结。\n\n"
+                f"用户回答：{answer.strip()}"
+            )
+        else:
+            prompt = (
+                "用户已回答上一轮澄清问题。请继续 PlanBridge。\n"
+                "要求：如果还需要信息，输出 planmode.v1 needs_input JSON；"
+                "如果信息充分，输出 planmode.v1 plan_ready JSON。\n"
+                "禁止执行实现。\n\n"
+                f"用户回答：{answer.strip()}"
+            )
         payload = {
             "prompt": prompt,
             "cwd": self._workspace_path,
@@ -1087,7 +1356,7 @@ class TelegramChannel(BaseChannel):
         new_id = created.get("task_id")
         await self._reply_text(chat_id, f"已提交续跑任务：{new_id}")
 
-    async def _submit_plan_run(self, chat_id: int | str, task_id: str) -> None:
+    async def _submit_plan_run(self, chat_id: int | str, task_id: str, sandbox: str) -> None:
         """Create a normal execution task from a plan_ready task."""
         try:
             parent = await self._listener_get_json(f"/tasks/{task_id}")
@@ -1114,6 +1383,7 @@ class TelegramChannel(BaseChannel):
             "cwd": self._workspace_path,
             "workflow_mode": "normal",
             "parent_task_id": task_id,
+            "sandbox": sandbox,
         }
         try:
             created = await self._listener_post_json("/tasks", payload)
@@ -1121,7 +1391,10 @@ class TelegramChannel(BaseChannel):
             await self._reply_text(chat_id, f"提交执行任务失败：{e}")
             return
         new_id = created.get("task_id")
-        await self._reply_text(chat_id, f"已提交执行任务：{new_id}")
+        await self._reply_text(
+            chat_id,
+            f"已提交执行任务：{new_id}\n模式：{self._sandbox_mode_label(sandbox)}（{sandbox}）",
+        )
 
     async def _cancel_task(self, chat_id: int | str, task_id: str) -> None:
         """Cancel a running/pending listener task."""
@@ -1133,34 +1406,227 @@ class TelegramChannel(BaseChannel):
         status = task.get("status")
         await self._reply_text(chat_id, f"已处理取消请求：task_id={task_id}, status={status}")
 
-    async def _list_open_needs_input_tasks(self) -> list[dict[str, Any]]:
-        """Return unresolved plan_bridge needs_input tasks."""
+    def _collect_referenced_parent_ids(self, tasks: list[dict[str, Any]]) -> set[str]:
+        """Collect parent task IDs that are already consumed by child tasks."""
+        referenced: set[str] = set()
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            parent = t.get("parent_task_id")
+            if isinstance(parent, str) and parent.strip():
+                referenced.add(parent.strip())
+        return referenced
+
+    def _sort_tasks_desc(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Sort tasks by created_at descending."""
+        return sorted(tasks, key=lambda t: str(t.get("created_at") or ""), reverse=True)
+
+    async def _list_open_reply_tasks(self) -> list[dict[str, Any]]:
+        """Return unresolved plan_bridge tasks that can accept user reply."""
         tasks = await self._listener_get_json("/tasks")
         if not isinstance(tasks, list):
             return []
-        referenced: set[str] = set()
-        for t in tasks:
-            if isinstance(t, dict):
-                parent = t.get("parent_task_id")
-                if isinstance(parent, str) and parent.strip():
-                    referenced.add(parent.strip())
+        referenced = self._collect_referenced_parent_ids(tasks)
         result: list[dict[str, Any]] = []
         for t in tasks:
             if not isinstance(t, dict):
                 continue
             task_id = str(t.get("task_id") or "").strip()
-            if not task_id:
-                continue
-            if t.get("bridge_stage") != "needs_input":
-                continue
-            if task_id in referenced:
+            if not task_id or task_id in referenced:
                 continue
             if str(t.get("workflow_mode") or "") != "plan_bridge":
                 continue
+            if str(t.get("status") or "") != "completed":
+                continue
             if not str(t.get("session_id") or "").strip():
                 continue
+            stage = str(t.get("bridge_stage") or "none").strip().lower()
+            if stage not in {"needs_input", "none"}:
+                continue
             result.append(t)
-        return result
+        return self._sort_tasks_desc(result)
+
+    async def _list_open_plan_ready_tasks(self) -> list[dict[str, Any]]:
+        """Return unresolved plan_bridge tasks that are ready to execute."""
+        tasks = await self._listener_get_json("/tasks")
+        if not isinstance(tasks, list):
+            return []
+        referenced = self._collect_referenced_parent_ids(tasks)
+        result: list[dict[str, Any]] = []
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            task_id = str(t.get("task_id") or "").strip()
+            if not task_id or task_id in referenced:
+                continue
+            if str(t.get("workflow_mode") or "") != "plan_bridge":
+                continue
+            if str(t.get("status") or "") != "completed":
+                continue
+            if str(t.get("bridge_stage") or "").strip().lower() != "plan_ready":
+                continue
+            result.append(t)
+        return self._sort_tasks_desc(result)
+
+    async def _list_cancellable_tasks(self) -> list[dict[str, Any]]:
+        """Return pending/running tasks that can be cancelled."""
+        tasks = await self._listener_get_json("/tasks")
+        if not isinstance(tasks, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            status = str(t.get("status") or "").strip().lower()
+            if status not in {"pending", "running"}:
+                continue
+            if not str(t.get("task_id") or "").strip():
+                continue
+            result.append(t)
+        return self._sort_tasks_desc(result)
+
+    async def _list_open_needs_input_tasks(self) -> list[dict[str, Any]]:
+        """Return unresolved plan_bridge needs_input tasks."""
+        tasks = await self._list_open_reply_tasks()
+        return [t for t in tasks if str(t.get("bridge_stage") or "").strip().lower() == "needs_input"]
+
+    async def _reply_plan_run_mode_picker(self, chat_id: int | str, task_id: str) -> None:
+        """Ask user to choose sandbox mode before running plan."""
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🧱 沙箱", callback_data=f"pb1|mode_ws|{task_id}"),
+                    InlineKeyboardButton("⚠️ Full Access", callback_data=f"pb1|mode_full|{task_id}"),
+                ]
+            ]
+        )
+        await self._reply_text(
+            chat_id,
+            f"请选择本次执行权限（task_id={task_id}）：\n"
+            "沙箱=workspace-write，Full Access=danger-full-access。",
+            reply_markup=keyboard,
+        )
+
+    async def _start_plan_run_confirm(self, chat_id: int | str, task_id: str, sandbox: str) -> None:
+        """Start run confirmation flow with explicit sandbox mode."""
+        chat_key = str(chat_id)
+        key = (chat_key, task_id)
+        if self.config.plan_bridge_require_execute_confirm:
+            self._pending_exec_confirms[key] = sandbox
+            confirm_action = "exec_confirm_full" if sandbox == "danger-full-access" else "exec_confirm_ws"
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ 确认执行", callback_data=f"pb1|{confirm_action}|{task_id}"),
+                        InlineKeyboardButton("❎ 取消", callback_data=f"pb1|exec_abort|{task_id}"),
+                    ]
+                ]
+            )
+            await self._reply_text(
+                chat_id,
+                f"请二次确认是否执行计划（task_id={task_id}）。\n"
+                f"本次模式：{self._sandbox_mode_label(sandbox)}（{sandbox}）",
+                reply_markup=keyboard,
+            )
+            return
+        await self._submit_plan_run(chat_id, task_id, sandbox)
+
+    async def _reply_task_mode_picker(self, chat_id: int | str) -> None:
+        """Show one-time mode picker for next normal chat task."""
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🧱 下条用沙箱", callback_data="pb1|setmode_ws|next"),
+                    InlineKeyboardButton("⚠️ 下条用 Full", callback_data="pb1|setmode_full|next"),
+                ]
+            ]
+        )
+        ttl = max(1, int(self.config.task_mode_token_ttl_seconds))
+        await self._reply_text(
+            chat_id,
+            f"请选择下一条普通任务消息的执行权限（一次性，{ttl} 秒过期）。",
+            reply_markup=keyboard,
+        )
+
+    async def _reply_plan_picker(
+        self,
+        chat_id: int | str,
+        mode: str,
+    ) -> None:
+        """Show candidate tasks for /plan-* commands."""
+        try:
+            if mode == "reply":
+                tasks = await self._list_open_reply_tasks()
+            elif mode == "run":
+                tasks = await self._list_open_plan_ready_tasks()
+            elif mode == "cancel":
+                tasks = await self._list_cancellable_tasks()
+            else:
+                await self._reply_text(chat_id, f"未知选择器模式：{mode}")
+                return
+        except RuntimeError as e:
+            await self._reply_text(chat_id, f"读取任务列表失败：{e}")
+            return
+
+        if not tasks:
+            if mode == "reply":
+                await self._reply_text(chat_id, "当前没有可回复的 Plan 任务。")
+            elif mode == "run":
+                await self._reply_text(chat_id, "当前没有可执行的 plan_ready 任务。")
+            else:
+                await self._reply_text(chat_id, "当前没有可取消的 pending/running 任务。")
+            return
+
+        tasks = tasks[:12]
+        rows: list[list[InlineKeyboardButton]] = []
+        for task in tasks:
+            task_id = str(task.get("task_id") or "").strip()
+            if not task_id:
+                continue
+            if mode == "reply":
+                stage = str(task.get("bridge_stage") or "none").strip().lower() or "none"
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            f"✍️ {task_id} [{stage}]",
+                            switch_inline_query_current_chat=f"/plan-reply {task_id} ",
+                        ),
+                        InlineKeyboardButton("状态", callback_data=f"pb1|status|{task_id}"),
+                    ]
+                )
+            elif mode == "run":
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            f"✅ {task_id} [plan_ready]",
+                            callback_data=f"pb1|exec|{task_id}",
+                        ),
+                        InlineKeyboardButton("状态", callback_data=f"pb1|status|{task_id}"),
+                    ]
+                )
+            else:
+                status = str(task.get("status") or "unknown").strip().lower()
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            f"🛑 {task_id} [{status}]",
+                            callback_data=f"pb1|cancel_task|{task_id}",
+                        ),
+                        InlineKeyboardButton("状态", callback_data=f"pb1|status|{task_id}"),
+                    ]
+                )
+
+        if not rows:
+            await self._reply_text(chat_id, "未找到可操作任务。")
+            return
+
+        if mode == "reply":
+            text = "请选择要回复的 Plan 任务：\n点击后将预填 `/plan-reply <task_id> `。"
+        elif mode == "run":
+            text = "请选择要执行的 plan_ready 任务：\n选中后会先让你选择 Sandbox 或 Full Access。"
+        else:
+            text = "请选择要取消的任务："
+        await self._reply_text(chat_id, text, reply_markup=InlineKeyboardMarkup(rows))
 
     def _sender_id(self, user_id: int, username: str | None) -> str:
         """Build sender id with username compatibility."""
@@ -1168,12 +1634,21 @@ class TelegramChannel(BaseChannel):
             return f"{user_id}|{username}"
         return str(user_id)
 
-    async def _reply_text(self, chat_id: int | str, text: str) -> None:
+    async def _reply_text(
+        self,
+        chat_id: int | str,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
         """Reply to chat with a plain text message."""
         if not self._app:
             return
         try:
-            await self._app.bot.send_message(chat_id=int(chat_id), text=text)
+            await self._app.bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_markup=reply_markup,
+            )
         except Exception as e:
             logger.warning(f"Reply failed: {e}")
 

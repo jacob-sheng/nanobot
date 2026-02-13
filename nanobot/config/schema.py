@@ -25,6 +25,9 @@ class TelegramConfig(BaseModel):
     plan_bridge_buttons_enabled: bool = True  # Show PlanBridge inline buttons from listener
     plan_bridge_auto_bind_natural_language: bool = True  # Auto-bind plain text replies to single open needs_input task
     plan_bridge_require_execute_confirm: bool = True  # Require second tap before creating execution task
+    plan_bridge_run_mode_required: bool = True  # Require explicit sandbox/full mode before plan execution
+    task_mode_soft_gate_enabled: bool = True  # Allow one-time mode token to bias next normal chat task
+    task_mode_token_ttl_seconds: int = 900  # One-time mode token TTL in seconds
     send_retry_enabled: bool = True  # Persist failed outbound messages and retry when Telegram API recovers
     send_retry_initial_seconds: int = 5  # Initial retry interval in seconds
     send_retry_max_seconds: int = 300  # Maximum retry interval in seconds
