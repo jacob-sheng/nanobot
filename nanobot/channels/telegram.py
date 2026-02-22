@@ -809,6 +809,19 @@ class TelegramChannel(BaseChannel):
             content_parts.append(message.text)
         if message.caption:
             content_parts.append(message.caption)
+
+        # Include quoted/replied-to message content so the agent can see it
+        if message.reply_to_message:
+            reply_msg = message.reply_to_message
+            quoted_parts: list[str] = []
+            if reply_msg.text:
+                quoted_parts.append(reply_msg.text)
+            elif reply_msg.caption:
+                quoted_parts.append(reply_msg.caption)
+            if quoted_parts:
+                quoted_text = "\n".join(quoted_parts)
+                # Prepend the quoted content before the user's message
+                content_parts.insert(0, f"[引用消息]\n{quoted_text}\n[/引用消息]")
         
         # Handle media files
         media_file = None
