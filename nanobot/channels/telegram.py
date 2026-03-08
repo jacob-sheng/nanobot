@@ -8,12 +8,13 @@ import json
 from pathlib import Path
 import re
 import time
+import unicodedata
 from typing import TYPE_CHECKING, Any
 import urllib.error
 import urllib.request
 
 from loguru import logger
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
 from telegram.error import (
     BadRequest,
     Forbidden,
@@ -254,6 +255,74 @@ class TelegramChannel(BaseChannel):
         self._api_available: bool | None = None
         self._dropped_counts_by_chat: dict[str, int] = {}
         self._send_seq = 0
+        self._media_group_buffers: dict[str, dict] = {}
+        self._media_group_tasks: dict[str, asyncio.Task] = {}
+        self._message_threads: dict[tuple[str, int], int] = {}
+
+    def is_allowed(self, sender_id: str) -> bool:
+        """Preserve Telegram's legacy id|username allowlist matching."""
+        if super().is_allowed(sender_id):
+            return True
+
+        allow_list = getattr(self.config, "allow_from", [])
+        if not allow_list or "*" in allow_list:
+            return False
+
+        sender_str = str(sender_id)
+        if sender_str.count("|") != 1:
+            return False
+
+        sid, username = sender_str.split("|", 1)
+        if not sid.isdigit() or not username:
+            return False
+
+        return sid in allow_list or username in allow_list
+
+    @staticmethod
+    def _derive_topic_session_key(message) -> str | None:
+        """Derive topic-scoped session key for non-private Telegram chats."""
+        message_thread_id = getattr(message, "message_thread_id", None)
+        if message.chat.type == "private" or message_thread_id is None:
+            return None
+        return f"telegram:{message.chat_id}:topic:{message_thread_id}"
+
+    @staticmethod
+    def _build_message_metadata(message, user) -> dict:
+        """Build common Telegram inbound metadata payload."""
+        return {
+            "message_id": message.message_id,
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "is_group": message.chat.type != "private",
+            "message_thread_id": getattr(message, "message_thread_id", None),
+            "is_forum": bool(getattr(message.chat, "is_forum", False)),
+        }
+
+    def _remember_thread_context(self, message) -> None:
+        """Cache topic thread id by chat/message id for follow-up replies."""
+        message_thread_id = getattr(message, "message_thread_id", None)
+        if message_thread_id is None:
+            return
+        key = (str(message.chat_id), message.message_id)
+        self._message_threads[key] = message_thread_id
+        if len(self._message_threads) > 1000:
+            self._message_threads.pop(next(iter(self._message_threads)))
+
+    async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Forward slash commands to the bus for unified handling in AgentLoop."""
+        if not update.message or not update.effective_user:
+            return
+        message = update.message
+        user = update.effective_user
+        self._remember_thread_context(message)
+        await self._handle_message(
+            sender_id=self._sender_id(user.id, user.username),
+            chat_id=str(message.chat_id),
+            content=message.text,
+            metadata=self._build_message_metadata(message, user),
+            session_key=self._derive_topic_session_key(message),
+        )
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -293,8 +362,9 @@ class TelegramChannel(BaseChannel):
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL),
-                self._on_message
+                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
+                & ~filters.COMMAND,
+                self._on_message,
             )
         )
 
@@ -381,22 +451,57 @@ class TelegramChannel(BaseChannel):
         if not self._app:
             logger.warning("Telegram bot not running")
             return
-        
-        # Stop typing indicator for this chat
-        self._stop_typing(msg.chat_id)
+
+        meta = msg.metadata or {}
+        is_progress = bool(meta.get("_progress", False))
+
+        # Only stop typing indicator for final responses
+        if not is_progress:
+            self._stop_typing(msg.chat_id)
         text_content = (msg.content or "").strip()
         if not text_content:
             text_content = "抱歉，这次回复为空。请再发一次，我马上重试。"
 
         try:
-            chat_id = str(int(msg.chat_id))
+            chat_id_int = int(msg.chat_id)
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
             return
 
+        chat_id = str(chat_id_int)
+        reply_to_message_id = meta.get("message_id")
+        message_thread_id = meta.get("message_thread_id")
+        try:
+            reply_to_message_id_int = int(reply_to_message_id) if reply_to_message_id is not None else None
+        except (TypeError, ValueError):
+            reply_to_message_id_int = None
+        try:
+            message_thread_id_int = int(message_thread_id) if message_thread_id is not None else None
+        except (TypeError, ValueError):
+            message_thread_id_int = None
+
+        if message_thread_id_int is None and reply_to_message_id_int is not None:
+            message_thread_id_int = self._message_threads.get((chat_id, reply_to_message_id_int))
+
+        thread_kwargs: dict[str, Any] = {}
+        if message_thread_id_int is not None:
+            thread_kwargs["message_thread_id"] = message_thread_id_int
+
+        reply_params = None
+        if self.config.reply_to_message and reply_to_message_id_int is not None:
+            reply_params = ReplyParameters(
+                message_id=reply_to_message_id_int,
+                allow_sending_without_reply=True,
+            )
+
         message_id = self._new_message_id(chat_id)
         try:
-            await self._send_message_with_fallback(chat_id, text_content)
+            await self._send_message_with_fallback(
+                chat_id,
+                text_content,
+                reply_parameters=reply_params,
+                thread_kwargs=thread_kwargs,
+            )
             self._api_available = True
             return
         except Exception as e:
@@ -420,7 +525,7 @@ class TelegramChannel(BaseChannel):
                     attempts=0,
                     next_retry_at=time.time() + max(1, int(self.config.send_retry_initial_seconds)),
                     last_error=str(e),
-                )
+                    )
             )
             logger.warning(
                 "queued_for_retry "
@@ -441,24 +546,43 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning(f"Background task stopped with error: {e}")
 
-    async def _send_message_with_fallback(self, chat_id: str, text: str) -> None:
+    async def _send_message_with_fallback(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_parameters: ReplyParameters | None = None,
+        thread_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         """Try HTML first, then fallback to plain text."""
         if not self._app:
             raise RuntimeError("Telegram app not running")
+        thread_kwargs = thread_kwargs or {}
         html_content = _markdown_to_telegram_html(text)
         try:
-            await self._app.bot.send_message(
-                chat_id=int(chat_id),
-                text=html_content,
-                parse_mode="HTML",
-            )
+            kwargs: dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": html_content,
+                "parse_mode": "HTML",
+                **thread_kwargs,
+            }
+            if reply_parameters is not None:
+                kwargs["reply_parameters"] = reply_parameters
+            await self._app.bot.send_message(**kwargs)
             return
         except Exception as html_error:
             logger.warning(
                 "HTML parse failed, falling back to plain text: "
                 f"chat_id={chat_id}, error={html_error}"
             )
-        await self._app.bot.send_message(chat_id=int(chat_id), text=text)
+        kwargs = {
+            "chat_id": int(chat_id),
+            "text": text,
+            **thread_kwargs,
+        }
+        if reply_parameters is not None:
+            kwargs["reply_parameters"] = reply_parameters
+        await self._app.bot.send_message(**kwargs)
 
     def _new_message_id(self, chat_id: str) -> str:
         """Generate a local unique message id for outbox tracking."""
@@ -816,7 +940,7 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
-        sender_id = self._sender_id(user)
+        sender_id = self._sender_id(user.id, user.username)
         self._remember_thread_context(message)
 
         # Store chat_id for replies

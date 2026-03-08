@@ -474,6 +474,13 @@ class AgentLoop:
         # Log response preview
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+        # If the message tool already sent a message to the same target in this turn,
+        # suppress the final reply to avoid duplicate user-visible messages.
+        if message_tool := self.tools.get("message"):
+            if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+                return None
+
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
