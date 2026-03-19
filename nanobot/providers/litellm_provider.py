@@ -12,6 +12,7 @@ from litellm import acompletion
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.callbacks import ConversationCallback
 from nanobot.providers.registry import find_by_model, find_gateway
 
 # Standard chat-completion message keys.
@@ -40,10 +41,12 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
+        conversation_callback: ConversationCallback | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self._conversation_callback = conversation_callback
 
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
@@ -232,6 +235,7 @@ class LiteLLMProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -270,8 +274,18 @@ class LiteLLMProvider(LLMProvider):
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
 
+        # Callbacks: custom conversation callback + LangSmith
+        callbacks_list = []
+        if self._conversation_callback:
+            callbacks_list.append(self._conversation_callback)
         if self._langsmith_enabled:
-            kwargs.setdefault("callbacks", []).append("langsmith")
+            callbacks_list.append("langsmith")
+        if callbacks_list:
+            kwargs["callbacks"] = callbacks_list
+
+        # Pass metadata for callback correlation (session_key, agent_type, etc.)
+        if metadata:
+            kwargs["metadata"] = metadata
 
         # Pass api_key directly — more reliable than env vars alone
         if self.api_key:

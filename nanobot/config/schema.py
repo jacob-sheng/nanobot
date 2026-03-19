@@ -143,6 +143,17 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class TracingConfig(Base):
+    """Configuration for LLM call tracing."""
+
+    enabled: bool = True
+    jsonl_path: str | None = None  # e.g., "logs/traces.jsonl"
+
+    # LangSmith integration (built-in LiteLLM support)
+    langsmith_enabled: bool = False  # Override env var detection
+    langsmith_project: str = "nanobot"
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -151,6 +162,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    tracing: TracingConfig = Field(default_factory=TracingConfig)
 
     @property
     def workspace_path(self) -> Path:

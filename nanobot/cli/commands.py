@@ -442,6 +442,7 @@ def _make_provider(config: Config):
             default_model=model,
         )
     else:
+        from nanobot.providers.callbacks import ConversationCallback
         from nanobot.providers.litellm_provider import LiteLLMProvider
         from nanobot.providers.registry import find_by_name
         spec = find_by_name(provider_name)
@@ -449,12 +450,23 @@ def _make_provider(config: Config):
             console.print("[red]Error: No API key configured.[/red]")
             console.print("Set one in ~/.nanobot/config.json under providers section")
             raise typer.Exit(1)
+
+        # Create callback if tracing is enabled
+        callback = None
+        if config.tracing.enabled:
+            jsonl_path = config.tracing.jsonl_path
+            # Resolve relative paths relative to workspace
+            if jsonl_path:
+                jsonl_path = str(config.workspace_path / jsonl_path)
+            callback = ConversationCallback(jsonl_path=jsonl_path)
+
         provider = LiteLLMProvider(
             api_key=p.api_key if p else None,
             api_base=config.get_api_base(model),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
             provider_name=provider_name,
+            conversation_callback=callback,
         )
 
     defaults = config.agents.defaults
