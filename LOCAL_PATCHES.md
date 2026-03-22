@@ -20,6 +20,7 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Kept `HISTORY.md` archival behavior but disabled automatic history-to-Mem0 syncing in the current local policy.
 - Added volatile-content filtering so news, weather, forecasts, system status, and similar summaries do not enter Mem0.
 - Added `NANOBOT_DISABLE_SEMANTIC_MEMORY=1` support to hard-disable semantic memory for selected processes.
+- Added automatic turn-level memory capture for durable user facts/preferences, with Mem0 dedupe and a lightweight `（我记下了）` hint after successful writes.
 
 Key files to re-check after every upstream merge:
 
@@ -61,6 +62,8 @@ Key files to re-check after every upstream merge:
   - `MEMORY.md` should stay empty
   - `HISTORY.md` stays as archive only
   - volatile digest content must not be stored in Mem0
+  - turn-level auto-capture is enabled locally for broad life-assistant memories
+  - transient short-term states should not be auto-stored
 
 ### Upgrade Checklist
 

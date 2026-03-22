@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.bus.events import InboundMessage
 from nanobot.agent.semantic_memory import NimAsymmetricEmbedding, SemanticMemory
 from nanobot.agent.tools.semantic_memory import MemoryAddTool
 from nanobot.bus.queue import MessageBus
@@ -31,6 +33,12 @@ class _FakeMemoryBackend:
     def __init__(self):
         self.add_calls: list[tuple[tuple, dict]] = []
         self.search_calls: list[tuple[tuple, dict]] = []
+        self.search_result_payload = {
+            "results": [
+                {"memory": "User likes jasmine tea", "score": 0.91},
+                {"memory": "User prefers concise answers", "score": 0.78},
+            ]
+        }
 
     def add(self, *args, **kwargs):
         self.add_calls.append((args, kwargs))
@@ -38,12 +46,7 @@ class _FakeMemoryBackend:
 
     def search(self, *args, **kwargs):
         self.search_calls.append((args, kwargs))
-        return {
-            "results": [
-                {"memory": "User likes jasmine tea", "score": 0.91},
-                {"memory": "User prefers concise answers", "score": 0.78},
-            ]
-        }
+        return self.search_result_payload
 
 
 def _semantic_config() -> Config:
@@ -54,6 +57,28 @@ def _semantic_config() -> Config:
                     "enabled": True,
                     "nim": {
                         "credentialsFile": "~/NIM.key",
+                    },
+                }
+            }
+        }
+    )
+
+
+def _auto_capture_config() -> Config:
+    return Config.model_validate(
+        {
+            "memory": {
+                "semantic": {
+                    "enabled": True,
+                    "nim": {
+                        "credentialsFile": "~/NIM.key",
+                    },
+                    "autoCapture": {
+                        "enabled": True,
+                        "scope": "broad_life",
+                        "notifyMode": "inline_hint",
+                        "minConfidence": 0.78,
+                        "dedupeThreshold": 0.9,
                     },
                 }
             }
@@ -205,6 +230,92 @@ def test_semantic_memory_treats_current_event_briefs_as_volatile() -> None:
     assert SemanticMemory.is_volatile_content(text) is True
 
 
+def test_semantic_memory_treats_short_term_life_updates_as_transient() -> None:
+    text = "我今晚还得补作业，明天周一还要早起。"
+
+    assert SemanticMemory.is_transient_content(text) is True
+
+
+@pytest.mark.asyncio
+async def test_auto_capture_turn_stores_stable_user_fact(tmp_path, monkeypatch) -> None:
+    backend = _FakeMemoryBackend()
+    backend.search_result_payload = {"results": []}
+    monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(
+            content='{"should_store": true, "memory_text": "用户把 nanobot 当作生活助手，不只限工作。", "category": "assistant_role", "confidence": 0.95}'
+        )
+    )
+
+    memory = SemanticMemory(_auto_capture_config().memory, tmp_path)
+    result = await memory.auto_capture_turn(
+        provider=provider,
+        model="test-model",
+        user_message="不只记录工作相关内容。这是个生活助手，我可能什么都会和 nanobot 发和分享、聊天。",
+        recent_messages=[{"role": "assistant", "content": "那我们把范围开大一点。"}],
+    )
+
+    assert result.stored is True
+    assert result.memory_text == "用户把 nanobot 当作生活助手，不只限工作。"
+    add_args, add_kwargs = backend.add_calls[0]
+    assert add_args[0]["content"] == "用户把 nanobot 当作生活助手，不只限工作。"
+    assert add_kwargs["metadata"] == {"source": "auto_turn", "category": "assistant_role"}
+
+
+@pytest.mark.asyncio
+async def test_auto_capture_turn_skips_transient_user_updates(tmp_path, monkeypatch) -> None:
+    backend = _FakeMemoryBackend()
+    monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock()
+
+    memory = SemanticMemory(_auto_capture_config().memory, tmp_path)
+    result = await memory.auto_capture_turn(
+        provider=provider,
+        model="test-model",
+        user_message="我今晚还得补作业，明天周一还要早起。",
+        recent_messages=[],
+    )
+
+    assert result.stored is False
+    assert result.reason == "filtered"
+    provider.chat_with_retry.assert_not_awaited()
+    assert backend.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_capture_turn_skips_duplicates(tmp_path, monkeypatch) -> None:
+    backend = _FakeMemoryBackend()
+    backend.search_result_payload = {
+        "results": [
+            {"memory": "用户偏好在聊天中自动记住值得长期保留的信息。", "score": 0.97},
+        ]
+    }
+    monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(
+            content='{"should_store": true, "memory_text": "用户偏好在聊天中自动记住值得长期保留的信息。", "category": "preference", "confidence": 0.96}'
+        )
+    )
+
+    memory = SemanticMemory(_auto_capture_config().memory, tmp_path)
+    result = await memory.auto_capture_turn(
+        provider=provider,
+        model="test-model",
+        user_message="要是我希望 nanobot 能在对话中也记住一些值得记住的东西怎么办，自动的",
+        recent_messages=[],
+    )
+
+    assert result.stored is False
+    assert result.reason == "duplicate"
+    assert backend.add_calls == []
+
+
 @pytest.mark.asyncio
 async def test_loop_injects_semantic_recall_into_prompt(tmp_path) -> None:
     provider = MagicMock()
@@ -221,6 +332,7 @@ async def test_loop_injects_semantic_recall_into_prompt(tmp_path) -> None:
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.semantic_memory = SimpleNamespace(
         enabled=True,
+        auto_capture_enabled=False,
         search_context=AsyncMock(return_value="# Semantic Recall\n\n- User likes jasmine tea"),
         add_history_entry=AsyncMock(),
     )
@@ -232,3 +344,42 @@ async def test_loop_injects_semantic_recall_into_prompt(tmp_path) -> None:
     system_prompt = provider.chat_with_retry.await_args.kwargs["messages"][0]["content"]
     assert "# Semantic Recall" in system_prompt
     assert "User likes jasmine tea" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_loop_emits_memory_hint_after_main_reply(tmp_path, monkeypatch) -> None:
+    backend = _FakeMemoryBackend()
+    backend.search_result_payload = {"results": []}
+    monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.estimate_prompt_tokens.return_value = (10, "test-counter")
+    provider.chat_with_retry = AsyncMock(
+        side_effect=[
+            LLMResponse(content="主回复", tool_calls=[]),
+            LLMResponse(
+                content='{"should_store": true, "memory_text": "用户偏好在聊天中自动记住值得长期保留的信息。", "category": "preference", "confidence": 0.94}'
+            ),
+        ]
+    )
+
+    bus = MessageBus()
+    loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        memory_config=_auto_capture_config().memory,
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="我希望你在对话里自动记住值得长期保留的东西。")
+    await loop._dispatch(msg)
+
+    main_reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+    assert main_reply.content == "主回复"
+
+    hint_reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+    assert hint_reply.content == "（我记下了）"
+    assert hint_reply.metadata == {"_memory_hint": True}

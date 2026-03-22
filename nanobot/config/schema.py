@@ -114,6 +114,18 @@ class SemanticMem0Config(Base):
     on_disk: bool = True
 
 
+class SemanticAutoCaptureConfig(Base):
+    """Automatic long-term memory extraction from conversation turns."""
+
+    enabled: bool = False
+    scope: Literal["broad_life"] = "broad_life"
+    notify_mode: Literal["off", "inline_hint"] = "off"
+    min_confidence: float = 0.78
+    dedupe_threshold: float = 0.9
+    max_input_chars: int = 1200
+    context_messages: int = 4
+
+
 class SemanticMemoryConfig(Base):
     """Semantic long-term memory configuration."""
 
@@ -126,6 +138,7 @@ class SemanticMemoryConfig(Base):
     search_threshold: float = 0.3
     nim: SemanticNimConfig = Field(default_factory=SemanticNimConfig)
     mem0: SemanticMem0Config = Field(default_factory=SemanticMem0Config)
+    auto_capture: SemanticAutoCaptureConfig = Field(default_factory=SemanticAutoCaptureConfig)
 
 
 class MarkdownMemoryConfig(Base):
