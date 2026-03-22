@@ -227,7 +227,8 @@ async def test_loop_injects_semantic_recall_into_prompt(tmp_path) -> None:
 
     response = await loop.process_direct("What tea do I like?", session_key="cli:test")
 
-    assert response == "ok"
+    assert response is not None
+    assert response.content == "ok"
     system_prompt = provider.chat_with_retry.await_args.kwargs["messages"][0]["content"]
     assert "# Semantic Recall" in system_prompt
     assert "User likes jasmine tea" in system_prompt
