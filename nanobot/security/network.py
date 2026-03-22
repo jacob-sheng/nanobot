@@ -21,6 +21,9 @@ _BLOCKED_NETWORKS = [
 ]
 
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
+_METADATA_EXPLICIT_HOSTS = {"metadata.google.internal"}
+_METADATA_EXPLICIT_IPS = {"169.254.169.254", "169.254.170.2", "100.100.100.200"}
+_METADATA_LINK_LOCAL_V4 = ipaddress.ip_network("169.254.0.0/16")
 
 
 def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -101,4 +104,49 @@ def contains_internal_url(command: str) -> bool:
         ok, _ = validate_url_target(url)
         if not ok:
             return True
+    return False
+
+
+def contains_metadata_url(command: str) -> bool:
+    """Return True if command contains cloud metadata service URLs."""
+    for m in _URL_RE.finditer(command):
+        url = m.group(0)
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            continue
+
+        hostname = (parsed.hostname or "").strip().lower()
+        if not hostname:
+            continue
+
+        if hostname in _METADATA_EXPLICIT_HOSTS:
+            return True
+
+        try:
+            addr = ipaddress.ip_address(hostname)
+        except ValueError:
+            addr = None
+
+        if addr is not None:
+            if str(addr) in _METADATA_EXPLICIT_IPS:
+                return True
+            if isinstance(addr, ipaddress.IPv4Address) and addr in _METADATA_LINK_LOCAL_V4:
+                return True
+            continue
+
+        try:
+            infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            continue
+
+        for info in infos:
+            try:
+                resolved = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                continue
+            if str(resolved) in _METADATA_EXPLICIT_IPS:
+                return True
+            if isinstance(resolved, ipaddress.IPv4Address) and resolved in _METADATA_LINK_LOCAL_V4:
+                return True
     return False

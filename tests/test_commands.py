@@ -179,6 +179,51 @@ def test_config_falls_back_to_vllm_when_ollama_not_configured():
     assert config.get_api_base() == "http://localhost:8000"
 
 
+def test_config_parses_semantic_memory_settings_from_camel_case():
+    config = Config.model_validate(
+        {
+            "memory": {
+                "markdown": {
+                    "enabled": False,
+                    "loadLongTermIntoContext": False,
+                    "persistLongTerm": False,
+                    "persistHistory": False,
+                    "auditSemanticWrites": False,
+                    "readHistoryOnDemandOnly": True,
+                },
+                "semantic": {
+                    "enabled": True,
+                    "syncHistoryEntries": False,
+                    "scope": "global",
+                    "userId": "global",
+                    "topK": 8,
+                    "maxContextChars": 2000,
+                    "searchThreshold": 0.3,
+                    "nim": {
+                        "model": "nvidia/llama-nemotron-embed-vl-1b-v2",
+                        "baseUrl": "https://integrate.api.nvidia.com/v1",
+                        "credentialsFile": "~/NIM.key",
+                    },
+                    "mem0": {
+                        "collectionName": "nanobot_global",
+                        "qdrantPath": "~/.nanobot/state/mem0/qdrant",
+                        "embeddingDims": 2048,
+                        "onDisk": True,
+                    },
+                }
+            }
+        }
+    )
+
+    assert config.memory.markdown.enabled is False
+    assert config.memory.markdown.persist_long_term is False
+    assert config.memory.semantic.enabled is True
+    assert config.memory.semantic.sync_history_entries is False
+    assert config.memory.semantic.user_id == "global"
+    assert config.memory.semantic.nim.model == "nvidia/llama-nemotron-embed-vl-1b-v2"
+    assert config.memory.semantic.mem0.embedding_dims == 2048
+
+
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
     spec = find_by_model("github-copilot/gpt-5.3-codex")
 

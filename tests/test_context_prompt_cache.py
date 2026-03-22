@@ -8,6 +8,7 @@ from pathlib import Path
 import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.config.schema import Config
 
 
 class _FakeDatetime(real_datetime):
@@ -71,3 +72,37 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_system_prompt_accepts_extra_sections(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt(extra_sections=["# Semantic Recall\n\n- User likes jasmine tea"])
+
+    assert "# Semantic Recall" in prompt
+    assert "User likes jasmine tea" in prompt
+
+
+def test_system_prompt_omits_markdown_memory_when_disabled(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    (workspace / "memory").mkdir()
+    (workspace / "memory" / "MEMORY.md").write_text("secret legacy fact", encoding="utf-8")
+    config = Config.model_validate(
+        {
+            "memory": {
+                "markdown": {
+                    "enabled": False,
+                },
+                "semantic": {
+                    "enabled": True,
+                },
+            }
+        }
+    )
+
+    builder = ContextBuilder(workspace, memory_config=config.memory)
+    prompt = builder.build_system_prompt()
+
+    assert "secret legacy fact" not in prompt
+    assert "Markdown memory files are disabled" in prompt

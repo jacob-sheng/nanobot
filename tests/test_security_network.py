@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from nanobot.security.network import contains_internal_url, validate_url_target
+from nanobot.security.network import contains_internal_url, contains_metadata_url, validate_url_target
 
 
 def _fake_resolve(host: str, results: list[str]):
@@ -99,3 +99,26 @@ def test_allows_normal_curl():
 
 def test_no_urls_returns_false():
     assert not contains_internal_url("echo hello && ls -la")
+
+
+# ---------------------------------------------------------------------------
+# contains_metadata_url — metadata endpoint detection for exec guard
+# ---------------------------------------------------------------------------
+
+def test_detects_metadata_explicit_ip():
+    assert contains_metadata_url("curl -s http://169.254.169.254/latest/meta-data/")
+
+
+def test_detects_metadata_google_internal():
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("metadata.google.internal", ["169.254.169.254"])):
+        assert contains_metadata_url("curl http://metadata.google.internal/computeMetadata/v1/")
+
+
+def test_metadata_check_allows_localhost():
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("localhost", ["127.0.0.1"])):
+        assert not contains_metadata_url("curl http://localhost:19823/health")
+
+
+def test_metadata_check_allows_private_non_metadata():
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("intranet.local", ["10.0.0.5"])):
+        assert not contains_metadata_url("curl http://intranet.local/api")

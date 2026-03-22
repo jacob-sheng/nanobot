@@ -6,6 +6,7 @@ import platform
 from pathlib import Path
 from typing import Any
 
+from nanobot.config.schema import MemoryConfig
 from nanobot.utils.helpers import current_time_str
 
 from nanobot.agent.memory import MemoryStore
@@ -19,12 +20,17 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, memory_config: MemoryConfig | None = None):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.memory_config = memory_config or MemoryConfig()
+        self.memory = MemoryStore(workspace, markdown_config=self.memory_config.markdown)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        extra_sections: list[str] | None = None,
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -51,6 +57,9 @@ Skills with available="false" need dependencies installed first - you can try in
 
 {skills_summary}""")
 
+        if extra_sections:
+            parts.extend(section for section in extra_sections if section and section.strip())
+
         return "\n\n---\n\n".join(parts)
 
     def _get_identity(self) -> str:
@@ -58,6 +67,8 @@ Skills with available="false" need dependencies installed first - you can try in
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
+        markdown = self.memory_config.markdown
+        semantic = self.memory_config.semantic
 
         platform_policy = ""
         if system == "Windows":
@@ -72,6 +83,39 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
+        memory_lines = [
+            f"- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md",
+        ]
+        if semantic.enabled:
+            memory_lines.insert(
+                0,
+                "- Semantic memory: use the `memory_add` and `memory_search` tools for long-term recall.",
+            )
+        if markdown.enabled:
+            long_term_note = (
+                "auto-loaded into context"
+                if markdown.load_long_term_into_context
+                else "not auto-loaded"
+            )
+            history_note = (
+                "on-demand only"
+                if markdown.read_history_on_demand_only
+                else "available for manual search"
+            )
+            memory_lines.insert(
+                1 if semantic.enabled else 0,
+                f"- Markdown memory file: {workspace_path}/memory/MEMORY.md ({long_term_note}).",
+            )
+            memory_lines.insert(
+                2 if semantic.enabled else 1,
+                f"- History log: {workspace_path}/memory/HISTORY.md ({history_note}).",
+            )
+        else:
+            memory_lines.insert(
+                1 if semantic.enabled else 0,
+                "- Markdown memory files are disabled; do not rely on MEMORY.md or HISTORY.md unless the user explicitly asks.",
+            )
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant.
@@ -81,9 +125,7 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+{chr(10).join(memory_lines)}
 
 {platform_policy}
 
@@ -122,6 +164,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         history: list[dict[str, Any]],
         current_message: str,
         skill_names: list[str] | None = None,
+        extra_sections: list[str] | None = None,
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
@@ -138,7 +181,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, extra_sections)},
             *history,
             {"role": "user", "content": merged},
         ]

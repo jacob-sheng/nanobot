@@ -15,12 +15,14 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.semantic_memory import SemanticMemory
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.semantic_memory import MemoryAddTool, MemorySearchTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -30,7 +32,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, MemoryConfig, WebSearchConfig
     from nanobot.cron.service import CronService
 
 
@@ -64,6 +66,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        memory_config: MemoryConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -80,7 +83,8 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(workspace, memory_config=memory_config)
+        self.semantic_memory = SemanticMemory(memory_config, workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -110,6 +114,12 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            markdown_config=memory_config.markdown if memory_config else None,
+            on_history_entry=(
+                self.semantic_memory.add_history_entry
+                if self.semantic_memory.enabled and self.semantic_memory.config and self.semantic_memory.config.sync_history_entries
+                else None
+            ),
         )
         self._register_default_tools()
 
@@ -132,6 +142,9 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        if self.semantic_memory.enabled:
+            self.tools.register(MemoryAddTool(self.semantic_memory))
+            self.tools.register(MemorySearchTool(self.semantic_memory))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -179,6 +192,40 @@ class AgentLoop:
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    @staticmethod
+    def _extract_guard_reason(messages: list[dict]) -> str | None:
+        """Extract the latest safety-guard block reason from tool results."""
+        marker = "Error: Command blocked by safety guard"
+        reason_re = re.compile(r"Error: Command blocked by safety guard \(([^)]+)\)")
+        for msg in reversed(messages):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or marker not in content:
+                continue
+            matched = reason_re.search(content)
+            if matched:
+                return matched.group(1).strip()
+            return content.strip().splitlines()[0]
+        return None
+
+    @staticmethod
+    def _extract_latest_tool_result(messages: list[dict], max_chars: int = 4000) -> str | None:
+        """Extract latest non-empty tool result for fallback messaging."""
+        for msg in reversed(messages):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            text = content.strip()
+            if not text:
+                continue
+            if len(text) > max_chars:
+                return text[:max_chars] + "\n... (truncated)"
+            return text
+        return None
 
     async def _run_agent_loop(
         self,
@@ -335,6 +382,7 @@ class AgentLoop:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
+        self.semantic_memory.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -419,9 +467,15 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        extra_sections: list[str] | None = None
+        if self.semantic_memory.enabled and not cmd.startswith("/"):
+            recall = await self.semantic_memory.search_context(msg.content)
+            if recall:
+                extra_sections = [recall]
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
+            extra_sections=extra_sections,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
@@ -439,7 +493,22 @@ class AgentLoop:
         )
 
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            guard_reason = self._extract_guard_reason(all_msgs)
+            if guard_reason:
+                final_content = (
+                    "I couldn't complete this because a safety guard blocked a command "
+                    f"({guard_reason})."
+                )
+            else:
+                latest_tool_result = self._extract_latest_tool_result(all_msgs)
+                if latest_tool_result:
+                    final_content = (
+                        "I completed tool execution, but the model returned an empty reply.\n"
+                        "Latest tool result:\n"
+                        f"{latest_tool_result}"
+                    )
+                else:
+                    final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)

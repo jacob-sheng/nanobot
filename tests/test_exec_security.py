@@ -1,4 +1,4 @@
-"""Tests for exec tool internal URL blocking."""
+"""Tests for exec tool metadata URL blocking and guard behavior."""
 
 from __future__ import annotations
 
@@ -30,15 +30,15 @@ async def test_exec_blocks_curl_metadata():
             command='curl -s -H "Metadata-Flavor: Google" http://169.254.169.254/computeMetadata/v1/'
         )
     assert "Error" in result
-    assert "internal" in result.lower() or "private" in result.lower()
+    assert "metadata" in result.lower()
 
 
 @pytest.mark.asyncio
-async def test_exec_blocks_wget_localhost():
+async def test_exec_allows_wget_localhost():
     tool = ExecTool()
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_localhost):
-        result = await tool.execute(command="wget http://localhost:8080/secret -O /tmp/out")
-    assert "Error" in result
+        guard_result = tool._guard_command("wget http://localhost:8080/secret -O /tmp/out", "/tmp")
+    assert guard_result is None
 
 
 @pytest.mark.asyncio
@@ -60,10 +60,19 @@ async def test_exec_allows_curl_to_public_url():
 
 @pytest.mark.asyncio
 async def test_exec_blocks_chained_internal_url():
-    """Internal URLs buried in chained commands should still be caught."""
+    """Metadata URLs buried in chained commands should still be caught."""
     tool = ExecTool()
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_private):
         result = await tool.execute(
             command="echo start && curl http://169.254.169.254/latest/meta-data/ && echo done"
         )
     assert "Error" in result
+
+
+@pytest.mark.asyncio
+async def test_exec_blocks_metadata_google_internal():
+    tool = ExecTool()
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_private):
+        result = await tool.execute(command="curl http://metadata.google.internal/computeMetadata/v1/")
+    assert "Error" in result
+    assert "metadata" in result.lower()
