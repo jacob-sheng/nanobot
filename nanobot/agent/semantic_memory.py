@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from openai import OpenAI
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.config.schema import MemoryConfig, SemanticMemoryConfig
+
+if TYPE_CHECKING:
+    from nanobot.providers.base import LLMProvider
 
 # Disable upstream telemetry by default before Mem0 is imported.
 os.environ.setdefault("MEM0_TELEMETRY", "False")
@@ -30,6 +35,17 @@ def _clip_text(text: str, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+@dataclass
+class AutoCaptureResult:
+    """Result of attempting to auto-capture a durable memory from a turn."""
+
+    stored: bool
+    memory_text: str | None = None
+    category: str | None = None
+    confidence: float | None = None
+    reason: str | None = None
 
 
 class NimAsymmetricEmbedding:
@@ -132,6 +148,50 @@ class SemanticMemory:
         "memory:",
         "available",
     )
+    _TEMPORAL_TERMS = (
+        "today",
+        "tonight",
+        "tomorrow",
+        "this week",
+        "this weekend",
+        "right now",
+        "currently",
+        "for now",
+        "later tonight",
+        "今天",
+        "今晚",
+        "明天",
+        "这周",
+        "周一",
+        "周末",
+        "现在",
+        "这会儿",
+        "刚刚",
+        "待会",
+        "稍后",
+    )
+    _EPHEMERAL_STATE_TERMS = (
+        "sleep",
+        "sleepy",
+        "tired",
+        "homework",
+        "going to bed",
+        "good night",
+        "补作业",
+        "睡觉",
+        "困",
+        "晚安",
+        "早起",
+        "先润",
+        "先撤",
+    )
+    _EXPLICIT_TRANSIENT_PATTERNS = (
+        re.compile(r"(?:我|i)\s*(?:现在|right now|currently).{0,18}(?:困|累|忙|tired|busy)", re.IGNORECASE),
+        re.compile(r"(?:我|i).{0,18}(?:准备睡觉|先睡了|going to bed|go to sleep|sleep now)", re.IGNORECASE),
+        re.compile(r"(?:今晚|tonight|明天|tomorrow).{0,24}(?:补作业|早起|homework|wake up early)", re.IGNORECASE),
+    )
+    _CODE_FENCE_RE = re.compile(r"```")
+    _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
 
     def __init__(self, config: MemoryConfig | None, workspace_path: Path):
         self.workspace_path = workspace_path
@@ -416,6 +476,44 @@ class SemanticMemory:
             return f"disabled ({self._init_error})"
         return "disabled"
 
+    @property
+    def auto_capture_enabled(self) -> bool:
+        return bool(self.enabled and self._config and self._config.auto_capture.enabled)
+
+    @classmethod
+    def _looks_like_transient_content(cls, content: str) -> bool:
+        temporal_hits = cls._keyword_hits(content, cls._TEMPORAL_TERMS)
+        state_hits = cls._keyword_hits(content, cls._EPHEMERAL_STATE_TERMS)
+        if any(pattern.search(content) for pattern in cls._EXPLICIT_TRANSIENT_PATTERNS):
+            return True
+        return temporal_hits >= 1 and state_hits >= 1
+
+    @classmethod
+    def _looks_like_tool_output(cls, text: str) -> bool:
+        raw = str(text or "")
+        if cls._CODE_FENCE_RE.search(raw):
+            return True
+        compact = cls._normalize_content(raw)
+        if "\n" not in raw:
+            return False
+        return (
+            "traceback" in compact
+            or "exit code" in compact
+            or "/home/" in compact
+            or "/opt/" in compact
+            or "\\mnt\\" in compact
+            or "python3 " in compact
+            or "npm " in compact
+            or "sudo " in compact
+        )
+
+    @classmethod
+    def is_transient_content(cls, text: str) -> bool:
+        content = cls._normalize_content(text)
+        if not content:
+            return False
+        return cls._looks_like_transient_content(content)
+
     def close(self) -> None:
         if not self._memory:
             return
@@ -431,3 +529,173 @@ class SemanticMemory:
                     client.close()
                 except Exception:
                     logger.debug("Ignoring semantic memory client close failure")
+
+    def should_auto_capture_turn(self, text: str) -> bool:
+        content = str(text or "").strip()
+        if not content:
+            return False
+        if self.is_volatile_content(content):
+            return False
+        if self.is_transient_content(content):
+            return False
+        if self._looks_like_tool_output(content):
+            return False
+        return True
+
+    @staticmethod
+    def _strip_json_fence(text: str) -> str:
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+            stripped = re.sub(r"\s*```$", "", stripped)
+        return stripped.strip()
+
+    @classmethod
+    def _parse_auto_capture_payload(cls, payload: str) -> dict[str, Any] | None:
+        cleaned = cls._strip_json_fence(payload)
+        candidates = [cleaned]
+        match = cls._JSON_BLOCK_RE.search(cleaned)
+        if match:
+            candidates.insert(0, match.group(0))
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                data = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
+
+    @staticmethod
+    def _recent_context_for_auto_capture(messages: list[dict[str, Any]], limit: int) -> str:
+        snippets: list[str] = []
+        for item in messages[-limit:]:
+            role = str(item.get("role") or "").lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = item.get("content")
+            if not isinstance(content, str):
+                continue
+            compact = _clip_text(content, 220)
+            if compact:
+                snippets.append(f"{role}: {compact}")
+        return "\n".join(snippets)
+
+    @staticmethod
+    def _normalize_candidate_memory(text: str) -> str:
+        compact = " ".join(str(text or "").split())
+        compact = compact.strip(" \n\r\t\"'")
+        return _clip_text(compact, 220)
+
+    async def auto_capture_turn(
+        self,
+        provider: "LLMProvider",
+        model: str,
+        user_message: str,
+        recent_messages: list[dict[str, Any]] | None = None,
+    ) -> AutoCaptureResult:
+        if not self.auto_capture_enabled or not self._config:
+            return AutoCaptureResult(stored=False, reason="disabled")
+
+        source_text = str(user_message or "").strip()
+        if not self.should_auto_capture_turn(source_text):
+            return AutoCaptureResult(stored=False, reason="filtered")
+
+        auto = self._config.auto_capture
+        context = self._recent_context_for_auto_capture(recent_messages or [], auto.context_messages)
+        clipped_source = _clip_text(source_text, auto.max_input_chars)
+        prompt = (
+            "从这段对话里判断，用户消息中是否出现了值得长期记住的稳定事实。\n"
+            "只根据用户侧事实判断，历史上下文仅用于消歧，不要把 assistant 的推测当真。\n"
+            "适合长期记忆的内容包括：身份信息、长期偏好、稳定习惯、长期关系设定、持续项目背景、长期约束。\n"
+            "不要记：新闻、天气、系统状态、工具输出、一次性任务、今天/今晚/这周安排、临时情绪、短期状态、玩笑废话。\n"
+            "如果值得记，memory_text 必须改写成一句简短、去上下文化、可长期复用的中文事实句；不要原样复制长对话。\n"
+            '只输出 JSON：{"should_store": boolean, "memory_text": string, "category": string, "confidence": number}\n\n'
+            f"最近上下文（仅供消歧）:\n{context or '(none)'}\n\n"
+            f"当前用户消息:\n{clipped_source}"
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "You extract durable user memories for a life-assistant. Return JSON only.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response = await provider.chat_with_retry(
+                messages=messages,
+                tools=None,
+                model=model,
+                max_tokens=220,
+                temperature=0,
+                reasoning_effort="low",
+            )
+        except Exception as exc:
+            logger.debug("Auto-capture LLM call failed: {}", exc)
+            return AutoCaptureResult(stored=False, reason="llm_error")
+
+        if response.finish_reason == "error" or not response.content:
+            return AutoCaptureResult(stored=False, reason="llm_empty")
+
+        payload = self._parse_auto_capture_payload(response.content)
+        if not payload:
+            return AutoCaptureResult(stored=False, reason="parse_error")
+
+        raw_should_store = payload.get("should_store")
+        if isinstance(raw_should_store, bool):
+            should_store = raw_should_store
+        else:
+            should_store = str(raw_should_store).strip().lower() in {"1", "true", "yes", "on"}
+        memory_text = self._normalize_candidate_memory(str(payload.get("memory_text") or ""))
+        category = str(payload.get("category") or "general").strip() or "general"
+        try:
+            confidence = float(payload.get("confidence", 0))
+        except Exception:
+            confidence = 0.0
+
+        if not should_store:
+            return AutoCaptureResult(stored=False, confidence=confidence, reason="model_rejected")
+        if confidence < auto.min_confidence:
+            return AutoCaptureResult(stored=False, memory_text=memory_text, category=category, confidence=confidence, reason="low_confidence")
+        if not memory_text:
+            return AutoCaptureResult(stored=False, category=category, confidence=confidence, reason="empty_memory")
+        if len(memory_text) > 220 or len(memory_text.split()) > 80:
+            return AutoCaptureResult(stored=False, category=category, confidence=confidence, reason="too_long")
+        if memory_text == clipped_source and len(source_text) > 80:
+            return AutoCaptureResult(stored=False, memory_text=memory_text, category=category, confidence=confidence, reason="raw_copy")
+        if not self.should_store_text(memory_text, metadata={"source": "auto_turn", "category": category}):
+            return AutoCaptureResult(stored=False, memory_text=memory_text, category=category, confidence=confidence, reason="filtered_after_extract")
+        if self.is_transient_content(memory_text):
+            return AutoCaptureResult(stored=False, memory_text=memory_text, category=category, confidence=confidence, reason="transient")
+
+        try:
+            existing = await self.search(memory_text, limit=3)
+        except Exception:
+            logger.debug("Auto-capture dedupe search failed", exc_info=True)
+            existing = []
+        for item in existing:
+            try:
+                score = float(item.get("score", 0))
+            except Exception:
+                score = 0.0
+            existing_memory = self._normalize_candidate_memory(str(item.get("memory") or ""))
+            if existing_memory == memory_text or score >= auto.dedupe_threshold:
+                return AutoCaptureResult(
+                    stored=False,
+                    memory_text=memory_text,
+                    category=category,
+                    confidence=confidence,
+                    reason="duplicate",
+                )
+
+        result = await self.add_text(
+            memory_text,
+            metadata={"source": "auto_turn", "category": category},
+            role="user",
+        )
+        count = len(result.get("results", [])) if isinstance(result, dict) else 0
+        if count <= 0:
+            return AutoCaptureResult(stored=False, memory_text=memory_text, category=category, confidence=confidence, reason="write_failed")
+        return AutoCaptureResult(stored=True, memory_text=memory_text, category=category, confidence=confidence)

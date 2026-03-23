@@ -382,6 +382,9 @@ class AgentLoop:
                 response = await self._process_message(msg)
                 if response is not None:
                     await self.bus.publish_outbound(response)
+                    auto_capture_request = getattr(response, "_auto_capture_request", None)
+                    if auto_capture_request:
+                        self._schedule_background(self._run_auto_capture(auto_capture_request))
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -420,6 +423,50 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    def _should_auto_capture(self, msg: InboundMessage, session_key: str) -> bool:
+        """Return True when this turn should be considered for automatic semantic memory."""
+        if not self.semantic_memory.auto_capture_enabled:
+            return False
+        if not msg.content.strip() or msg.content.lstrip().startswith("/"):
+            return False
+        if msg.channel == "system":
+            return False
+
+        lowered = session_key.lower()
+        if lowered.startswith("cron:"):
+            return False
+        if any(marker in lowered for marker in ("daily-digest", "heartbeat", "planbridge")):
+            return False
+
+        return self.semantic_memory.should_auto_capture_turn(msg.content)
+
+    async def _run_auto_capture(self, payload: dict[str, Any]) -> None:
+        """Extract and store durable user memories after the main reply is already sent."""
+        try:
+            result = await self.semantic_memory.auto_capture_turn(
+                provider=self.provider,
+                model=self.model,
+                user_message=payload["user_message"],
+                recent_messages=payload.get("recent_messages") or [],
+            )
+        except Exception:
+            logger.exception("Automatic semantic capture failed")
+            return
+
+        if not result.stored or not self.semantic_memory.config:
+            return
+
+        if self.semantic_memory.config.auto_capture.notify_mode == "inline_hint":
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=payload["channel"],
+                    chat_id=payload["chat_id"],
+                    content="（我记下了）",
+                    reply_to=payload.get("reply_to"),
+                    metadata={"_memory_hint": True},
+                )
+            )
 
     async def _process_message(
         self,
@@ -496,6 +543,7 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        auto_capture_request: dict[str, Any] | None = None
         extra_sections: list[str] | None = None
         if self.semantic_memory.enabled and not cmd.startswith("/"):
             recall = await self.semantic_memory.search_context(msg.content)
@@ -517,7 +565,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
@@ -543,15 +591,33 @@ class AgentLoop:
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
+        explicit_memory_write = "memory_add" in tools_used
+        if not explicit_memory_write and self._should_auto_capture(msg, session_key or msg.session_key):
+            context_limit = (
+                self.semantic_memory.config.auto_capture.context_messages * 2
+                if self.semantic_memory.config
+                else 8
+            )
+            auto_capture_request = {
+                "channel": msg.channel,
+                "chat_id": msg.chat_id,
+                "reply_to": msg.metadata.get("message_id"),
+                "user_message": msg.content,
+                "recent_messages": history[-context_limit:],
+            }
+
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-        return OutboundMessage(
+        response = OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
+        if auto_capture_request:
+            setattr(response, "_auto_capture_request", auto_capture_request)
+        return response
 
     @staticmethod
     def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
@@ -643,4 +709,9 @@ class AgentLoop:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        return await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        if response is not None:
+            auto_capture_request = getattr(response, "_auto_capture_request", None)
+            if auto_capture_request:
+                self._schedule_background(self._run_auto_capture(auto_capture_request))
+        return response
