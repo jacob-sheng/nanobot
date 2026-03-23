@@ -20,6 +20,9 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Kept `HISTORY.md` archival behavior but disabled automatic history-to-Mem0 syncing in the current local policy.
 - Added volatile-content filtering so news, weather, forecasts, system status, and similar summaries do not enter Mem0.
 - Added `NANOBOT_DISABLE_SEMANTIC_MEMORY=1` support to hard-disable semantic memory for selected processes.
+- Added automatic turn-level memory capture for durable user facts/preferences, with Mem0 dedupe and a lightweight `（我记下了）` hint after successful writes.
+- Explicit `memory_add` now suppresses same-turn auto-capture so one fact is not written twice.
+- Switched the default chat provider to the Herta OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://cpa.herta.us.ci/v1`.
 
 Key files to re-check after every upstream merge:
 
@@ -39,6 +42,11 @@ Key files to re-check after every upstream merge:
   - `/home/Hera/.nanobot/workspace/services/daily-digest/daily_digest.py`
 - That service must continue to pass:
   - `NANOBOT_DISABLE_SEMANTIC_MEMORY=1`
+- Service-level provider secrets live in:
+  - `/etc/default/nanobot`
+- Current external secret files in the home directory:
+  - `~/NIM.key` for NVIDIA NIM embeddings
+  - `~/OLLAMA_CLOUD.key` as the archived retired Ollama Cloud key
 
 ### Codex-Listener Dependency
 
@@ -55,12 +63,23 @@ Key files to re-check after every upstream merge:
 
 - Semantic memory global kill switch:
   - `NANOBOT_DISABLE_SEMANTIC_MEMORY=1`
+- Default chat provider:
+  - `agents.defaults.provider` must stay `custom`
+  - `agents.defaults.model` must stay `ollama/kimi-k2.5`
+  - `providers.custom.apiBase` must stay `https://cpa.herta.us.ci/v1`
+  - Do not switch back to `auto` while using the `ollama/...` model name, or nanobot may incorrectly resolve to the built-in local Ollama provider.
+- Provider secrets:
+  - `providers.vllm.apiKey` should remain absent from `~/.nanobot/config.json`
+  - `NANOBOT_PROVIDERS__CUSTOM__API_KEY` should be sourced from `/etc/default/nanobot`
 - Semantic embedding provider:
   - NVIDIA NIM via `NIM.key`
 - Memory policy:
   - `MEMORY.md` should stay empty
   - `HISTORY.md` stays as archive only
   - volatile digest content must not be stored in Mem0
+  - turn-level auto-capture is enabled locally for broad life-assistant memories
+  - explicit `memory_add` wins over same-turn auto-capture
+  - transient short-term states should not be auto-stored
 
 ### Upgrade Checklist
 

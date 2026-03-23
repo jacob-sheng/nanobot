@@ -312,6 +312,15 @@ def test_config_parses_semantic_memory_settings_from_camel_case():
                         "embeddingDims": 2048,
                         "onDisk": True,
                     },
+                    "autoCapture": {
+                        "enabled": True,
+                        "scope": "broad_life",
+                        "notifyMode": "inline_hint",
+                        "minConfidence": 0.8,
+                        "dedupeThreshold": 0.9,
+                        "maxInputChars": 1200,
+                        "contextMessages": 4,
+                    },
                 }
             }
         }
@@ -324,6 +333,8 @@ def test_config_parses_semantic_memory_settings_from_camel_case():
     assert config.memory.semantic.user_id == "global"
     assert config.memory.semantic.nim.model == "nvidia/llama-nemotron-embed-vl-1b-v2"
     assert config.memory.semantic.mem0.embedding_dims == 2048
+    assert config.memory.semantic.auto_capture.enabled is True
+    assert config.memory.semantic.auto_capture.notify_mode == "inline_hint"
 
 
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
