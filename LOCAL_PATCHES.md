@@ -1,6 +1,6 @@
 ## Local Maintenance Notes
 
-Last updated: 2026-03-22
+Last updated: 2026-03-24
 
 This file tracks local behavior that intentionally diverges from upstream so future upgrades can preserve it.
 
@@ -22,7 +22,9 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Added `NANOBOT_DISABLE_SEMANTIC_MEMORY=1` support to hard-disable semantic memory for selected processes.
 - Added automatic turn-level memory capture for durable user facts/preferences, with Mem0 dedupe and a lightweight `（我记下了）` hint after successful writes.
 - Explicit `memory_add` now suppresses same-turn auto-capture so one fact is not written twice.
-- Switched the default chat provider to the Herta OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://cpa.herta.us.ci/v1`.
+- Switched the default chat provider to the AxonHub OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://any.herta.us.ci/v1`.
+- Added a local Weixin bridge channel backed by `nanobot/channels/weixin.py` and `bridge/src/weixin*.ts`.
+- Weixin login/runtime state lives under `~/.nanobot/weixin-auth`, with `nanobot-weixin-bridge.service` as the long-running bridge host.
 
 Key files to re-check after every upstream merge:
 
@@ -31,10 +33,15 @@ Key files to re-check after every upstream merge:
 - `nanobot/agent/memory.py`
 - `nanobot/agent/semantic_memory.py`
 - `nanobot/agent/tools/semantic_memory.py`
+- `nanobot/channels/weixin.py`
+- `bridge/src/weixin-api.ts`
+- `bridge/src/weixin-auth.ts`
+- `bridge/src/weixin-index.ts`
+- `bridge/src/weixin.ts`
 - `nanobot/config/schema.py`
 - `nanobot/skills/memory/SKILL.md`
 - `tests/test_semantic_memory.py`
-- `tests/test_memory_consolidation_types.py`
+- `tests/channels/test_weixin_channel.py`
 
 ### Related Local Changes Outside This Repo
 
@@ -44,9 +51,12 @@ Key files to re-check after every upstream merge:
   - `NANOBOT_DISABLE_SEMANTIC_MEMORY=1`
 - Service-level provider secrets live in:
   - `/etc/default/nanobot`
+- Weixin bridge service unit lives in:
+  - `/etc/systemd/system/nanobot-weixin-bridge.service`
 - Current external secret files in the home directory:
   - `~/NIM.key` for NVIDIA NIM embeddings
   - `~/OLLAMA_CLOUD.key` as the archived retired Ollama Cloud key
+  - `~/axonhub.key` for the active AxonHub API key
 
 ### Codex-Listener Dependency
 
@@ -66,7 +76,7 @@ Key files to re-check after every upstream merge:
 - Default chat provider:
   - `agents.defaults.provider` must stay `custom`
   - `agents.defaults.model` must stay `ollama/kimi-k2.5`
-  - `providers.custom.apiBase` must stay `https://cpa.herta.us.ci/v1`
+  - `providers.custom.apiBase` must stay `https://any.herta.us.ci/v1`
   - Do not switch back to `auto` while using the `ollama/...` model name, or nanobot may incorrectly resolve to the built-in local Ollama provider.
 - Provider secrets:
   - `providers.vllm.apiKey` should remain absent from `~/.nanobot/config.json`
@@ -90,7 +100,21 @@ Key files to re-check after every upstream merge:
 - Re-run the focused test suite before restarting services.
 - Restart and check:
   - `nanobot-gateway`
+  - `nanobot-weixin-bridge`
   - `codex-listener`
+
+### 2026-03-24 Backup And Update Record
+
+- Runtime backup directory:
+  - `/home/Hera/.nanobot/backup/update-20260324-190605`
+- System packages refreshed:
+  - `openssl` / `libssl*`
+  - `openssh-*`
+  - `libc6` / `libc-bin`
+  - `nodejs` / `libnode*`
+  - `tzdata`
+- Upstream merge target refreshed to:
+  - `origin/main` at `72acba5`
 
 ### 2026-03-22 Backup And Update Record
 

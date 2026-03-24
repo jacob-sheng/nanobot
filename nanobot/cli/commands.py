@@ -33,7 +33,8 @@ from rich.table import Table
 from rich.text import Text
 
 from nanobot import __logo__, __version__
-from nanobot.config.paths import get_workspace_path
+from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
+from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
 from nanobot.utils.helpers import sync_workspace_templates
 
@@ -188,46 +189,13 @@ async def _print_interactive_response(
     await run_in_terminal(_write)
 
 
-class _ThinkingSpinner:
-    """Spinner wrapper with pause support for clean progress output."""
-
-    def __init__(self, enabled: bool):
-        self._spinner = console.status(
-            "[dim]nanobot is thinking...[/dim]", spinner="dots"
-        ) if enabled else None
-        self._active = False
-
-    def __enter__(self):
-        if self._spinner:
-            self._spinner.start()
-        self._active = True
-        return self
-
-    def __exit__(self, *exc):
-        self._active = False
-        if self._spinner:
-            self._spinner.stop()
-        return False
-
-    @contextmanager
-    def pause(self):
-        """Temporarily stop spinner while printing progress."""
-        if self._spinner and self._active:
-            self._spinner.stop()
-        try:
-            yield
-        finally:
-            if self._spinner and self._active:
-                self._spinner.start()
-
-
-def _print_cli_progress_line(text: str, thinking: _ThinkingSpinner | None) -> None:
+def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
     """Print a CLI progress line, pausing the spinner if needed."""
     with thinking.pause() if thinking else nullcontext():
         console.print(f"  [dim]↳ {text}[/dim]")
 
 
-async def _print_interactive_progress_line(text: str, thinking: _ThinkingSpinner | None) -> None:
+async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
     """Print an interactive progress line, pausing the spinner if needed."""
     with thinking.pause() if thinking else nullcontext():
         await _print_interactive_line(text)
@@ -326,7 +294,7 @@ def onboard(
 
     # Run interactive wizard if enabled
     if wizard:
-        from nanobot.cli.onboard_wizard import run_onboard
+        from nanobot.cli.onboard import run_onboard
 
         try:
             result = run_onboard(initial_config=config)
@@ -441,6 +409,14 @@ def _make_provider(config: Config):
             api_base=p.api_base,
             default_model=model,
         )
+    # OpenVINO Model Server: direct OpenAI-compatible endpoint at /v3
+    elif provider_name == "ovms":
+        from nanobot.providers.custom_provider import CustomProvider
+        provider = CustomProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=config.get_api_base(model) or "http://localhost:8000/v3",
+            default_model=model,
+        )
     else:
         from nanobot.providers.litellm_provider import LiteLLMProvider
         from nanobot.providers.registry import find_by_name
@@ -503,6 +479,17 @@ def _warn_deprecated_config_keys(config_path: Path | None) -> None:
         )
 
 
+def _migrate_cron_store(config: "Config") -> None:
+    """One-time migration: move legacy global cron store into the workspace."""
+    from nanobot.config.paths import get_cron_dir
+
+    legacy_path = get_cron_dir() / "jobs.json"
+    new_path = config.workspace_path / "cron" / "jobs.json"
+    if legacy_path.is_file() and not new_path.exists():
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.move(str(legacy_path), str(new_path))
+
 
 # ============================================================================
 # Gateway / Server
@@ -520,7 +507,6 @@ def gateway(
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
-    from nanobot.config.paths import get_cron_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
@@ -539,8 +525,12 @@ def gateway(
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
-    # Create cron service first (callback set after agent creation)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    # Preserve existing single-workspace installs, but keep custom workspaces clean.
+    if is_default_workspace(config.workspace_path):
+        _migrate_cron_store(config)
+
+    # Create cron service with workspace-scoped store
+    cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
@@ -644,6 +634,13 @@ def gateway(
             chat_id=chat_id,
             on_progress=_silent,
         )
+
+        # Keep a small tail of heartbeat history so the loop stays bounded
+        # without losing all short-term context between runs.
+        session = agent.sessions.get_or_create("heartbeat")
+        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
+        agent.sessions.save(session)
+
         return resp.content if resp else ""
 
     async def on_heartbeat_notify(response: str) -> None:
@@ -721,7 +718,6 @@ def agent(
 
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.paths import get_cron_dir
     from nanobot.cron.service import CronService
 
     config = _load_runtime_config(config, workspace)
@@ -730,8 +726,12 @@ def agent(
     bus = MessageBus()
     provider = _make_provider(config)
 
-    # Create cron service for tool usage (no callback needed for CLI unless running)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    # Preserve existing single-workspace installs, but keep custom workspaces clean.
+    if is_default_workspace(config.workspace_path):
+        _migrate_cron_store(config)
+
+    # Create cron service with workspace-scoped store
+    cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     if logs:
@@ -757,7 +757,7 @@ def agent(
     )
 
     # Shared reference for progress callbacks
-    _thinking: _ThinkingSpinner | None = None
+    _thinking: ThinkingSpinner | None = None
 
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
         ch = agent_loop.channels_config
@@ -770,18 +770,20 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            nonlocal _thinking
-            _thinking = _ThinkingSpinner(enabled=not logs)
-            with _thinking:
-                response = await agent_loop.process_direct(
-                    message, session_id, on_progress=_cli_progress,
-                )
-            _thinking = None
-            _print_agent_response(
-                response.content if response else "",
-                render_markdown=markdown,
-                metadata=response.metadata if response else None,
+            renderer = StreamRenderer(render_markdown=markdown)
+            response = await agent_loop.process_direct(
+                message, session_id,
+                on_progress=_cli_progress,
+                on_stream=renderer.on_delta,
+                on_stream_end=renderer.on_end,
             )
+            if not renderer.streamed:
+                await renderer.close()
+                _print_agent_response(
+                    response.content if response else "",
+                    render_markdown=markdown,
+                    metadata=response.metadata if response else None,
+                )
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -817,11 +819,27 @@ def agent(
             turn_done = asyncio.Event()
             turn_done.set()
             turn_response: list[tuple[str, dict]] = []
+            renderer: StreamRenderer | None = None
 
             async def _consume_outbound():
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+                        if msg.metadata.get("_stream_delta"):
+                            if renderer:
+                                await renderer.on_delta(msg.content)
+                            continue
+                        if msg.metadata.get("_stream_end"):
+                            if renderer:
+                                await renderer.on_end(
+                                    resuming=msg.metadata.get("_resuming", False),
+                                )
+                            continue
+                        if msg.metadata.get("_streamed"):
+                            turn_done.set()
+                            continue
+
                         if msg.metadata.get("_progress"):
                             is_tool_hint = msg.metadata.get("_tool_hint", False)
                             ch = agent_loop.channels_config
@@ -831,8 +849,9 @@ def agent(
                                 pass
                             else:
                                 await _print_interactive_progress_line(msg.content, _thinking)
+                            continue
 
-                        elif not turn_done.is_set():
+                        if not turn_done.is_set():
                             if msg.content:
                                 turn_response.append((msg.content, dict(msg.metadata or {})))
                             turn_done.set()
@@ -866,23 +885,28 @@ def agent(
 
                         turn_done.clear()
                         turn_response.clear()
+                        renderer = StreamRenderer(render_markdown=markdown)
 
                         await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
+                            metadata={"_wants_stream": True},
                         ))
 
-                        nonlocal _thinking
-                        _thinking = _ThinkingSpinner(enabled=not logs)
-                        with _thinking:
-                            await turn_done.wait()
-                        _thinking = None
+                        await turn_done.wait()
 
                         if turn_response:
                             content, meta = turn_response[0]
-                            _print_agent_response(content, render_markdown=markdown, metadata=meta)
+                            if content and not meta.get("_streamed"):
+                                if renderer:
+                                    await renderer.close()
+                                _print_agent_response(
+                                    content, render_markdown=markdown, metadata=meta,
+                                )
+                        elif renderer and not renderer.streamed:
+                            await renderer.close()
                     except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")
@@ -1028,25 +1052,58 @@ def _run_node_bridge(
 
 
 @channels_app.command("login")
-def channels_login():
-    """Link device via QR code."""
+def channels_login(
+    channel_name: str = typer.Argument(..., help="Channel name (e.g. whatsapp)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
+):
+    """Authenticate with a channel via QR code or other interactive login."""
+    from nanobot.channels.registry import discover_all
     from nanobot.config.loader import load_config
-    from nanobot.config.paths import get_runtime_subdir
 
     config = load_config()
+    from nanobot.config.paths import get_runtime_subdir
 
-    env = {**os.environ}
-    wa_cfg = getattr(config.channels, "whatsapp", None) or {}
-    bridge_token = wa_cfg.get("bridgeToken", "") if isinstance(wa_cfg, dict) else getattr(wa_cfg, "bridge_token", "")
-    if bridge_token:
-        env["BRIDGE_TOKEN"] = bridge_token
-    env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
-    _run_node_bridge(
-        script="dist/index.js",
-        bridge_env=env,
-        startup_title="Starting bridge...",
-        startup_hint="Scan the QR code to connect.",
-    )
+    if channel_name == "weixin":
+        console.print("[yellow]Use `nanobot weixin login` for Weixin.[/yellow]")
+        raise typer.Exit(1)
+
+    channel_cfg = getattr(config.channels, channel_name, None) or {}
+
+    all_channels = discover_all()
+    if channel_name not in all_channels:
+        available = ", ".join(all_channels.keys())
+        console.print(f"[red]Unknown channel: {channel_name}[/red]  Available: {available}")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} {all_channels[channel_name].display_name} Login\n")
+
+    if channel_name == "whatsapp":
+        env = {**os.environ}
+        bridge_token = (
+            channel_cfg.get("bridgeToken", "")
+            if isinstance(channel_cfg, dict)
+            else getattr(channel_cfg, "bridge_token", "")
+        )
+        if bridge_token:
+            env["BRIDGE_TOKEN"] = bridge_token
+        env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
+        _run_node_bridge(
+            script="dist/index.js",
+            bridge_env=env,
+            startup_title="Starting bridge...",
+            startup_hint="Scan the QR code to connect.",
+        )
+        return
+
+    channel_cls = all_channels[channel_name]
+    channel = channel_cls(channel_cfg, bus=None)
+    if not hasattr(channel, "login"):
+        console.print(f"[red]Channel {channel_name} does not support interactive login.[/red]")
+        raise typer.Exit(1)
+
+    success = asyncio.run(channel.login(force=force))
+    if not success:
+        raise typer.Exit(1)
 
 
 weixin_app = typer.Typer(help="Manage Weixin channel")
@@ -1273,19 +1330,19 @@ def weixin_finalize_login(
     )
     console.print(f"[green]✓[/green] Updated Weixin config at {updated}")
 
+    restart_cmd = ["systemctl", "restart", gateway_service]
     try:
-        result = subprocess.run(
-            ["systemctl", "restart", gateway_service],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or "").strip()
-        stdout = (e.stdout or "").strip()
-        detail = stderr or stdout or str(e)
-        console.print(f"[red]Failed to restart {gateway_service}: {detail}[/red]")
-        raise typer.Exit(1)
+        subprocess.run(restart_cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        restart_cmd = ["sudo", "-n", "systemctl", "restart", gateway_service]
+        try:
+            subprocess.run(restart_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            stdout = (e.stdout or "").strip()
+            detail = stderr or stdout or str(e)
+            console.print(f"[red]Failed to restart {gateway_service}: {detail}[/red]")
+            raise typer.Exit(1)
 
     status = subprocess.run(
         ["systemctl", "is-active", gateway_service],
