@@ -7,7 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _make_provider, app
+from nanobot.cli.commands import _finalize_weixin_login_state, _make_provider, app
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
@@ -200,6 +200,39 @@ def test_onboard_wizard_preserves_explicit_config_in_next_steps(tmp_path, monkey
     assert f"nanobot gateway --config {resolved_config}" in compact_output
 
 
+def test_finalize_weixin_login_state_updates_config(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "telegram_planbridge": {
+                        "enabled": True,
+                        "allowFrom": ["6682937110"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state_dir = tmp_path / "weixin-auth"
+    updated = _finalize_weixin_login_state(
+        config_path=config_path,
+        user_id="wx_user@im.wechat",
+        base_url="https://ilinkai.weixin.qq.com",
+        state_dir=state_dir,
+    )
+
+    assert updated == config_path
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert raw["channels"]["telegram_planbridge"]["enabled"] is True
+    assert raw["channels"]["weixin"]["enabled"] is True
+    assert raw["channels"]["weixin"]["bridgeUrl"] == "ws://127.0.0.1:3002"
+    assert raw["channels"]["weixin"]["allowFrom"] == ["wx_user@im.wechat"]
+    assert raw["channels"]["weixin"]["stateDir"] == str(state_dir)
+
+
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():
     config = Config()
     config.agents.defaults.model = "github-copilot/gpt-5.3-codex"
@@ -312,6 +345,15 @@ def test_config_parses_semantic_memory_settings_from_camel_case():
                         "embeddingDims": 2048,
                         "onDisk": True,
                     },
+                    "autoCapture": {
+                        "enabled": True,
+                        "scope": "broad_life",
+                        "notifyMode": "inline_hint",
+                        "minConfidence": 0.8,
+                        "dedupeThreshold": 0.9,
+                        "maxInputChars": 1200,
+                        "contextMessages": 4,
+                    },
                 }
             }
         }
@@ -324,6 +366,8 @@ def test_config_parses_semantic_memory_settings_from_camel_case():
     assert config.memory.semantic.user_id == "global"
     assert config.memory.semantic.nim.model == "nvidia/llama-nemotron-embed-vl-1b-v2"
     assert config.memory.semantic.mem0.embedding_dims == 2048
+    assert config.memory.semantic.auto_capture.enabled is True
+    assert config.memory.semantic.auto_capture.notify_mode == "inline_hint"
 
 
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():

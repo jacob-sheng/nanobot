@@ -226,3 +226,16 @@ def test_builtin_channel_init_from_dict():
     ch = TelegramChannel({"enabled": False, "token": "test-tok", "allowFrom": ["*"]}, bus)
     assert ch.config.token == "test-tok"
     assert ch.config.allow_from == ["*"]
+
+
+def test_weixin_channel_default_config_and_init():
+    """Weixin channel exposes defaults and accepts raw dict config."""
+    from nanobot.channels.weixin import WeixinChannel
+
+    cfg = WeixinChannel.default_config()
+    assert cfg["enabled"] is False
+    assert cfg["bridgeUrl"] == "ws://127.0.0.1:3002"
+
+    ch = WeixinChannel({"enabled": False, "allowFrom": ["*"]}, MessageBus())
+    assert ch.config.bridge_url == "ws://127.0.0.1:3002"
+    assert ch.config.allow_from == ["*"]

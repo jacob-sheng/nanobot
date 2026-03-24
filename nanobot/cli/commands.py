@@ -937,7 +937,7 @@ def channels_status():
     console.print(table)
 
 
-def _get_bridge_dir() -> Path:
+def _get_bridge_dir(force_rebuild: bool = False) -> Path:
     """Get the bridge directory, setting it up if needed."""
     import shutil
     import subprocess
@@ -945,10 +945,10 @@ def _get_bridge_dir() -> Path:
     # User's bridge location
     from nanobot.config.paths import get_bridge_install_dir
 
-    user_bridge = get_bridge_install_dir()
+    user_bridge = get_bridge_install_dir("bridge")
 
     # Check if already built
-    if (user_bridge / "dist" / "index.js").exists():
+    if not force_rebuild and (user_bridge / "dist" / "index.js").exists():
         return user_bridge
 
     # Check for npm
@@ -998,20 +998,42 @@ def _get_bridge_dir() -> Path:
     return user_bridge
 
 
-@channels_app.command("login")
-def channels_login():
-    """Link device via QR code."""
+def _run_node_bridge(
+    *,
+    script: str,
+    bridge_env: dict[str, str],
+    startup_title: str,
+    startup_hint: str | None = None,
+    force_rebuild: bool = False,
+) -> None:
+    """Run a bundled Node.js bridge entrypoint."""
     import shutil
     import subprocess
 
+    bridge_dir = _get_bridge_dir(force_rebuild=force_rebuild)
+    node_path = shutil.which("node")
+    if not node_path:
+        console.print("[red]node not found. Please install Node.js.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} {startup_title}")
+    if startup_hint:
+        console.print(f"{startup_hint}\n")
+
+    env = {**os.environ, **bridge_env}
+    try:
+        subprocess.run([node_path, script], cwd=bridge_dir, check=True, env=env)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Bridge failed: {e}[/red]")
+
+
+@channels_app.command("login")
+def channels_login():
+    """Link device via QR code."""
     from nanobot.config.loader import load_config
     from nanobot.config.paths import get_runtime_subdir
 
     config = load_config()
-    bridge_dir = _get_bridge_dir()
-
-    console.print(f"{__logo__} Starting bridge...")
-    console.print("Scan the QR code to connect.\n")
 
     env = {**os.environ}
     wa_cfg = getattr(config.channels, "whatsapp", None) or {}
@@ -1019,16 +1041,260 @@ def channels_login():
     if bridge_token:
         env["BRIDGE_TOKEN"] = bridge_token
     env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
+    _run_node_bridge(
+        script="dist/index.js",
+        bridge_env=env,
+        startup_title="Starting bridge...",
+        startup_hint="Scan the QR code to connect.",
+    )
 
-    npm_path = shutil.which("npm")
-    if not npm_path:
-        console.print("[red]npm not found. Please install Node.js.[/red]")
+
+weixin_app = typer.Typer(help="Manage Weixin channel")
+app.add_typer(weixin_app, name="weixin")
+
+
+def _load_weixin_channel_cfg(config_path: str | None = None) -> tuple[Config, Any]:
+    config = _load_runtime_config(config_path)
+    section = getattr(config.channels, "weixin", None) or {}
+    return config, section
+
+
+def _weixin_state_dir(config_path: str | None = None) -> Path:
+    from nanobot.config.paths import get_runtime_subdir
+
+    _config, section = _load_weixin_channel_cfg(config_path)
+    state_dir = (
+        section.get("stateDir", "")
+        if isinstance(section, dict)
+        else getattr(section, "state_dir", "")
+    )
+    if state_dir:
+        return Path(state_dir).expanduser().resolve()
+    return get_runtime_subdir("weixin-auth")
+
+
+def _resolve_config_path_for_runtime(config_path: str | None = None) -> Path:
+    from nanobot.config.loader import get_config_path
+
+    if config_path:
+        return Path(config_path).expanduser().resolve()
+    return get_config_path().resolve()
+
+
+def _finalize_weixin_login_state(
+    *,
+    config_path: Path,
+    user_id: str,
+    base_url: str,
+    state_dir: Path,
+) -> Path:
+    """Persist Weixin channel config for immediate use after QR login."""
+    import json
+
+    raw = {}
+    if config_path.exists():
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+
+    channels = raw.setdefault("channels", {})
+    section = channels.setdefault("weixin", {})
+    if not isinstance(section, dict):
+        section = {}
+        channels["weixin"] = section
+
+    allow_from = section.get("allowFrom")
+    if not isinstance(allow_from, list):
+        allow_from = []
+
+    normalized_allow = [str(item) for item in allow_from if str(item).strip()]
+    if user_id not in normalized_allow:
+        normalized_allow.append(user_id)
+
+    section["enabled"] = True
+    section["bridgeUrl"] = "ws://127.0.0.1:3002"
+    section["allowFrom"] = normalized_allow
+    section["stateDir"] = str(state_dir)
+    if not section.get("baseUrl"):
+        section["baseUrl"] = base_url
+    if "bridgeToken" not in section:
+        section["bridgeToken"] = ""
+    if "typingEnabled" not in section:
+        section["typingEnabled"] = True
+    if "mediaEnabled" not in section:
+        section["mediaEnabled"] = True
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    return config_path
+
+
+@weixin_app.command("login")
+def weixin_login(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Start the Weixin bridge and add/login an account via QR code."""
+    _config, section = _load_weixin_channel_cfg(config)
+    bridge_token = (
+        section.get("bridgeToken", "")
+        if isinstance(section, dict)
+        else getattr(section, "bridge_token", "")
+    )
+    base_url = (
+        section.get("baseUrl", "")
+        if isinstance(section, dict)
+        else getattr(section, "base_url", "")
+    )
+    env = {
+        "BRIDGE_PORT": "3002",
+        "AUTH_DIR": str(_weixin_state_dir(config)),
+        "WEIXIN_BASE_URL": base_url or "https://ilinkai.weixin.qq.com",
+        "WEIXIN_LOGIN": "1",
+        "WEIXIN_CONFIG_PATH": str(_resolve_config_path_for_runtime(config)),
+        "WEIXIN_GATEWAY_SERVICE": "nanobot-gateway.service",
+        "WEIXIN_NANOBOT_BIN": str(Path(sys.argv[0]).resolve()) if sys.argv and sys.argv[0] else "nanobot",
+        "WEIXIN_QR_PATH": str((Path.home() / "weixin-qr.png").resolve()),
+    }
+    if bridge_token:
+        env["BRIDGE_TOKEN"] = bridge_token
+
+    _run_node_bridge(
+        script="dist/weixin-index.js",
+        bridge_env=env,
+        startup_title="Starting Weixin bridge...",
+        startup_hint="Scan the QR code in this terminal to connect Weixin.",
+        force_rebuild=True,
+    )
+
+
+@weixin_app.command("bridge")
+def weixin_bridge(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Run the Weixin bridge using saved login state."""
+    _config, section = _load_weixin_channel_cfg(config)
+    bridge_token = (
+        section.get("bridgeToken", "")
+        if isinstance(section, dict)
+        else getattr(section, "bridge_token", "")
+    )
+    base_url = (
+        section.get("baseUrl", "")
+        if isinstance(section, dict)
+        else getattr(section, "base_url", "")
+    )
+    env = {
+        "BRIDGE_PORT": "3002",
+        "AUTH_DIR": str(_weixin_state_dir(config)),
+        "WEIXIN_BASE_URL": base_url or "https://ilinkai.weixin.qq.com",
+    }
+    if bridge_token:
+        env["BRIDGE_TOKEN"] = bridge_token
+
+    _run_node_bridge(
+        script="dist/weixin-index.js",
+        bridge_env=env,
+        startup_title="Starting Weixin bridge...",
+        force_rebuild=True,
+    )
+
+
+@weixin_app.command("status")
+def weixin_status(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Show saved Weixin accounts."""
+    import json
+
+    state_dir = _weixin_state_dir(config)
+    accounts_dir = state_dir / "accounts"
+    table = Table(title="Weixin Accounts")
+    table.add_column("Account", style="cyan")
+    table.add_column("User", style="magenta")
+    table.add_column("Base URL", style="green")
+    table.add_column("Saved", style="dim")
+
+    rows = 0
+    if accounts_dir.exists():
+        for path in sorted(accounts_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            table.add_row(
+                str(data.get("accountId") or path.stem),
+                str(data.get("userId") or "-"),
+                str(data.get("baseUrl") or "-"),
+                str(data.get("savedAt") or "-"),
+            )
+            rows += 1
+
+    if rows == 0:
+        console.print("[yellow]No saved Weixin accounts found.[/yellow]")
+        return
+    console.print(table)
+
+
+@weixin_app.command("logout")
+def weixin_logout(
+    account: str = typer.Argument(..., help="Saved Weixin account ID to remove"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Remove a saved Weixin account."""
+    state_dir = _weixin_state_dir(config)
+    account_file = state_dir / "accounts" / f"{account}.json"
+    sync_file = state_dir / "sync" / f"{account}.json"
+
+    if not account_file.exists():
+        console.print(f"[red]Account not found: {account}[/red]")
         raise typer.Exit(1)
 
+    account_file.unlink()
+    if sync_file.exists():
+        sync_file.unlink()
+    console.print(f"[green]✓[/green] Removed Weixin account {account}")
+
+
+@weixin_app.command("finalize-login", hidden=True)
+def weixin_finalize_login(
+    user_id: str = typer.Option(..., "--user-id"),
+    base_url: str = typer.Option(..., "--base-url"),
+    state_dir: str = typer.Option(..., "--state-dir"),
+    gateway_service: str = typer.Option("nanobot-gateway.service", "--gateway-service"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Internal helper: enable Weixin channel and restart gateway."""
+    import subprocess
+
+    config_path = _resolve_config_path_for_runtime(config)
+    updated = _finalize_weixin_login_state(
+        config_path=config_path,
+        user_id=user_id,
+        base_url=base_url,
+        state_dir=Path(state_dir).expanduser().resolve(),
+    )
+    console.print(f"[green]✓[/green] Updated Weixin config at {updated}")
+
     try:
-        subprocess.run([npm_path, "start"], cwd=bridge_dir, check=True, env=env)
+        result = subprocess.run(
+            ["systemctl", "restart", gateway_service],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     except subprocess.CalledProcessError as e:
-        console.print(f"[red]Bridge failed: {e}[/red]")
+        stderr = (e.stderr or "").strip()
+        stdout = (e.stdout or "").strip()
+        detail = stderr or stdout or str(e)
+        console.print(f"[red]Failed to restart {gateway_service}: {detail}[/red]")
+        raise typer.Exit(1)
+
+    status = subprocess.run(
+        ["systemctl", "is-active", gateway_service],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    state = (status.stdout or "").strip() or "unknown"
+    console.print(f"[green]✓[/green] Restarted {gateway_service} ({state})")
 
 
 # ============================================================================
