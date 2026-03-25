@@ -240,6 +240,7 @@ def build_status_content(
     *,
     version: str,
     model: str,
+    default_model: str | None,
     start_time: float,
     last_usage: dict[str, int],
     context_window_tokens: int,
@@ -259,9 +260,10 @@ def build_status_content(
     ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
     ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
     ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
+    model_line = model if not default_model or model == default_model else f"{model} (default: {default_model})"
     return "\n".join([
         f"\U0001f408 nanobot v{version}",
-        f"\U0001f9e0 Model: {model}",
+        f"\U0001f9e0 Model: {model_line}",
         f"\U0001f4ca Tokens: {last_in} in / {last_out} out",
         f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
         f"\U0001f4ac Session: {session_msg_count} messages",
