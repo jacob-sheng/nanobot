@@ -70,6 +70,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         memory_config: MemoryConfig | None = None,
+        timezone: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -88,7 +89,7 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
 
-        self.context = ContextBuilder(workspace, memory_config=memory_config)
+        self.context = ContextBuilder(workspace, memory_config=memory_config, timezone=timezone)
         self.semantic_memory = SemanticMemory(memory_config, workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -155,7 +156,9 @@ class AgentLoop:
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
-            self.tools.register(CronTool(self.cron_service))
+            self.tools.register(
+                CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
+            )
         if self.semantic_memory.enabled:
             self.tools.register(MemoryAddTool(self.semantic_memory))
             self.tools.register(MemorySearchTool(self.semantic_memory))

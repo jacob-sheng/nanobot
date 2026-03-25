@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+import nanobot.providers.base as provider_base
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.config.schema import MarkdownMemoryConfig
@@ -402,7 +403,7 @@ class TestMemoryConsolidationTypeHandling:
         async def _fake_sleep(delay: int) -> None:
             delays.append(delay)
 
-        monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+        monkeypatch.setattr(provider_base.asyncio, "sleep", _fake_sleep)
 
         result = await store.consolidate(messages, provider, "test-model")
 
@@ -438,7 +439,7 @@ class TestMemoryConsolidationTypeHandling:
         """Forced tool_choice rejected by provider -> retry with auto and succeed."""
         store = MemoryStore(tmp_path)
         error_resp = LLMResponse(
-            content="Error calling LLM: litellm.BadRequestError: "
+            content="Error calling LLM: BadRequestError: "
             "The tool_choice parameter does not support being set to required or object",
             finish_reason="error",
             tool_calls=[],

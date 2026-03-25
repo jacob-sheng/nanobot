@@ -120,7 +120,7 @@ npm audit fix
 ```
 
 **Important Notes:**
-- Keep `litellm` updated to the latest version for security fixes
+- Current `nanobot` no longer depends on `litellm`; legacy environments should avoid the poisoned `1.82.7` and `1.82.8` releases
 - We've updated `ws` to `>=8.17.1` to fix DoS vulnerability
 - Run `pip-audit` or `npm audit` regularly
 - Subscribe to security advisories for nanobot and its dependencies
