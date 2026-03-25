@@ -21,7 +21,6 @@ export interface InboundWeixinMessage {
   sender: string;
   content: string;
   timestamp: number;
-  contextToken?: string;
   media?: string[];
 }
 
@@ -29,6 +28,11 @@ interface SendCommand {
   type: 'send';
   to: string;
   text: string;
+}
+
+interface BridgeHeartbeat {
+  type: 'heartbeat';
+  timestamp: number;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -107,11 +111,14 @@ function guessImageExtension(url: string, contentType: string | null): string {
 }
 
 export class WeixinBridgeServer {
+  private static readonly HEARTBEAT_INTERVAL_MS = 15000;
   private wss: WebSocketServer | null = null;
   private clients = new Set<WebSocket>();
   private store: WeixinAccountStore;
   private accounts = new Map<string, SavedWeixinAccount>();
   private contextTokens = new Map<string, string>();
+  private monitorTasks = new Map<string, Promise<void>>();
+  private heartbeatTimer: NodeJS.Timeout | null = null;
   private stopped = false;
 
   constructor(
@@ -131,10 +138,12 @@ export class WeixinBridgeServer {
   async start(): Promise<void> {
     await this.store.init();
     this.wss = new WebSocketServer({ host: '127.0.0.1', port: this.port });
-    console.log(`🌉 Weixin bridge listening on ws://127.0.0.1:${this.port}`);
-    if (this.token) console.log('🔒 Token authentication enabled');
+    this.logInfo('bridge.start', { url: `ws://127.0.0.1:${this.port}` });
+    if (this.token) this.logInfo('bridge.auth_enabled');
+    this.startHeartbeatLoop();
 
     this.wss.on('connection', (ws) => {
+      this.logInfo('bridge.client_connecting', { remote: this.describeRemote(ws) });
       if (this.token) {
         const timeout = setTimeout(() => ws.close(4001, 'Auth timeout'), 5000);
         ws.once('message', (data) => {
@@ -163,12 +172,14 @@ export class WeixinBridgeServer {
 
     for (const account of saved) {
       this.accounts.set(account.accountId, account);
-      void this.monitorAccount(account);
+      this.startMonitor(account);
     }
   }
 
   private setupClient(ws: WebSocket): void {
     this.clients.add(ws);
+    this.logInfo('bridge.client_connected', { clients: this.clients.size });
+    this.sendHeartbeat(ws);
 
     ws.on('message', async (data) => {
       try {
@@ -178,12 +189,26 @@ export class WeixinBridgeServer {
           ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
         }
       } catch (error) {
+        this.logError('bridge.client_command_failed', { error: this.errorDetail(error) });
         ws.send(JSON.stringify({ type: 'error', error: String(error) }));
       }
     });
 
-    ws.on('close', () => this.clients.delete(ws));
-    ws.on('error', () => this.clients.delete(ws));
+    ws.on('close', (code, reason) => {
+      this.clients.delete(ws);
+      this.logWarning('bridge.client_closed', {
+        clients: this.clients.size,
+        code,
+        reason: reason.toString(),
+      });
+    });
+    ws.on('error', (error) => {
+      this.clients.delete(ws);
+      this.logWarning('bridge.client_error', {
+        clients: this.clients.size,
+        error: this.errorDetail(error),
+      });
+    });
   }
 
   private broadcast(payload: Record<string, unknown>): void {
@@ -196,26 +221,26 @@ export class WeixinBridgeServer {
   }
 
   private async loginViaQr(): Promise<SavedWeixinAccount> {
-    console.log('📱 正在启动微信扫码登录...\n');
+    this.logInfo('weixin.login_start');
     const initial = await fetchQrCode(this.baseUrl);
     this.broadcast({ type: 'qr', qr: initial.qrcodeUrl });
     await this.writeQrPng(initial.qrcodeUrl);
     qrcode.generate(initial.qrcodeUrl, { small: true });
-    console.log('\n请使用微信扫描二维码，等待连接结果...\n');
+    this.logInfo('weixin.login_waiting_for_scan');
 
     let currentQr = initial.qrcode;
     let refreshes = 0;
     while (!this.stopped) {
       const result = await pollQrStatus(this.baseUrl, currentQr);
       if (result.status === 'scaned') {
-        console.log('👀 已扫码，请继续在微信中确认...');
+        this.logInfo('weixin.login_scanned');
       }
       if (result.status === 'expired') {
         refreshes += 1;
         if (refreshes > 3) {
           throw new Error('二维码多次过期，请重新运行登录命令');
         }
-        console.log(`⏳ 二维码已过期，正在刷新... (${refreshes}/3)`);
+        this.logWarning('weixin.login_qr_expired', { refreshes, maxRefreshes: 3 });
         const next = await fetchQrCode(this.baseUrl);
         currentQr = next.qrcode;
         this.broadcast({ type: 'qr', qr: next.qrcodeUrl });
@@ -232,14 +257,16 @@ export class WeixinBridgeServer {
         if (result.ilink_user_id) {
           try {
             this.finalizeLogin(account, result.ilink_user_id);
-            console.log(`✓ 已更新 nanobot 配置并重启 ${this.gatewayService || 'nanobot-gateway.service'}`);
+            this.logInfo('weixin.login_finalized', {
+              gatewayService: this.gatewayService || 'nanobot-gateway.service',
+            });
           } catch (error) {
-            console.error(`Failed to finalize Weixin login for direct use: ${String(error)}`);
+            this.logError('weixin.login_finalize_failed', { error: this.errorDetail(error) });
           }
         } else {
-          console.error('登录已成功，但未拿到扫码用户 ID，未自动写入 allowFrom。');
+          this.logError('weixin.login_missing_user_id');
         }
-        console.log(`✅ 已连接微信账号 ${account.accountId}`);
+        this.logInfo('weixin.login_confirmed', { accountId: account.accountId });
         this.broadcast({
           type: 'status',
           status: 'connected',
@@ -264,7 +291,7 @@ export class WeixinBridgeServer {
         light: '#ffffff',
       },
     });
-    console.log(`🖼️ 已写入二维码图片: ${this.qrPath}`);
+    this.logInfo('weixin.qr_written', { path: this.qrPath });
   }
 
   private finalizeLogin(account: SavedWeixinAccount, userId: string): void {
@@ -302,6 +329,7 @@ export class WeixinBridgeServer {
 
   private async monitorAccount(account: SavedWeixinAccount): Promise<void> {
     this.broadcast({ type: 'status', status: 'connected', accountId: account.accountId, detail: 'monitor_started' });
+    this.logInfo('weixin.monitor_started', { accountId: account.accountId });
     let cursor = await this.store.loadSyncCursor(account.accountId);
     let timeoutMs = 35000;
 
@@ -316,9 +344,11 @@ export class WeixinBridgeServer {
           timeoutMs = response.longpolling_timeout_ms;
         }
         if ((response.ret ?? 0) !== 0 || (response.errcode ?? 0) !== 0) {
+          const detail = `${response.errmsg || response.errcode || response.ret}`;
+          this.logWarning('weixin.getupdates_failed', { accountId: account.accountId, detail });
           this.broadcast({
             type: 'error',
-            error: `weixin getupdates failed for ${account.accountId}: ${response.errmsg || response.errcode || response.ret}`,
+            error: `weixin getupdates failed for ${account.accountId}: ${detail}`,
           });
           await sleep(2000);
           continue;
@@ -328,6 +358,10 @@ export class WeixinBridgeServer {
           await this.handleInboundMessage(account, msg);
         }
       } catch (error) {
+        this.logWarning('weixin.monitor_error', {
+          accountId: account.accountId,
+          error: this.errorDetail(error),
+        });
         this.broadcast({
           type: 'status',
           status: 'disconnected',
@@ -337,6 +371,7 @@ export class WeixinBridgeServer {
         await sleep(5000);
       }
     }
+    this.logInfo('weixin.monitor_stopped', { accountId: account.accountId });
   }
 
   private extractMediaUrls(msg: WeixinMessage, kind: 'image' | 'file'): string[] {
@@ -365,7 +400,7 @@ export class WeixinBridgeServer {
     const urls = this.extractMediaUrls(msg, 'image');
     if (!urls.length) return [];
 
-    console.log(`🖼️ [weixin] received ${urls.length} image candidate(s) from ${sender}`);
+    this.logInfo('weixin.image_candidates', { accountId: account.accountId, sender, count: urls.length });
     await mkdir(this.mediaDir(), { recursive: true });
 
     const saved: string[] = [];
@@ -380,10 +415,10 @@ export class WeixinBridgeServer {
         const filename = `${accountPart}_${senderPart}_${stamp}_${index + 1}${ext}`;
         const fullPath = join(this.mediaDir(), filename);
         await writeFile(fullPath, data);
-        console.log(`💾 [weixin] image saved: ${fullPath}`);
+        this.logInfo('weixin.image_saved', { sender, path: fullPath });
         saved.push(fullPath);
       } catch (error) {
-        console.warn(`⚠️ [weixin] image download failed for ${sender}: ${String(error)}`);
+        this.logWarning('weixin.image_download_failed', { sender, error: this.errorDetail(error) });
       }
     }
 
@@ -405,7 +440,7 @@ export class WeixinBridgeServer {
     }
 
     if (media.length) {
-      console.log(`📨 [weixin] forwarding ${media.length} image(s) to nanobot for ${sender}`);
+      this.logInfo('weixin.forwarding_media', { accountId: account.accountId, sender, count: media.length });
     }
     this.broadcast({
       type: 'message',
@@ -414,7 +449,6 @@ export class WeixinBridgeServer {
       sender,
       content: finalContent,
       timestamp: msg.create_time_ms ?? Date.now(),
-      contextToken: msg.context_token,
       media,
     });
   }
@@ -437,18 +471,88 @@ export class WeixinBridgeServer {
       throw new Error(`No Weixin context token cached for ${toUserId} on ${accountId}`);
     }
 
+    this.logInfo('weixin.send_attempt', { accountId, toUserId });
     await sendMessage(account.baseUrl, account.token, toUserId, cmd.text, contextToken);
+    this.logInfo('weixin.send_success', { accountId, toUserId });
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
     for (const client of this.clients) {
       client.close();
     }
     this.clients.clear();
+    await Promise.allSettled([...this.monitorTasks.values()]);
+    this.monitorTasks.clear();
     if (this.wss) {
       this.wss.close();
       this.wss = null;
     }
+    this.logInfo('bridge.stopped');
+  }
+
+  private startHeartbeatLoop(): void {
+    this.heartbeatTimer = setInterval(() => {
+      const payload: BridgeHeartbeat = { type: 'heartbeat', timestamp: Date.now() };
+      this.broadcast(payload as unknown as Record<string, unknown>);
+    }, WeixinBridgeServer.HEARTBEAT_INTERVAL_MS);
+  }
+
+  private sendHeartbeat(client: WebSocket): void {
+    if (client.readyState !== WebSocket.OPEN) return;
+    const payload: BridgeHeartbeat = { type: 'heartbeat', timestamp: Date.now() };
+    client.send(JSON.stringify(payload));
+  }
+
+  private startMonitor(account: SavedWeixinAccount): void {
+    const task = this.monitorAccount(account)
+      .catch((error) => {
+        this.logError('weixin.monitor_crashed', {
+          accountId: account.accountId,
+          error: this.errorDetail(error),
+        });
+        if (!this.stopped) {
+          setTimeout(() => this.startMonitor(account), 5000);
+        }
+      })
+      .finally(() => {
+        if (this.monitorTasks.get(account.accountId) === task) {
+          this.monitorTasks.delete(account.accountId);
+        }
+      });
+    this.monitorTasks.set(account.accountId, task);
+  }
+
+  private describeRemote(ws: WebSocket): string {
+    const socket = (ws as WebSocket & { _socket?: { remoteAddress?: string; remotePort?: number } })._socket;
+    const address = socket?.remoteAddress || 'unknown';
+    const port = socket?.remotePort || 'unknown';
+    return `${address}:${port}`;
+  }
+
+  private errorDetail(error: unknown): string {
+    if (error instanceof Error) return `${error.name}: ${error.message}`;
+    return String(error);
+  }
+
+  private logInfo(event: string, fields?: Record<string, unknown>): void {
+    this.log('INFO', event, fields);
+  }
+
+  private logWarning(event: string, fields?: Record<string, unknown>): void {
+    this.log('WARN', event, fields);
+  }
+
+  private logError(event: string, fields?: Record<string, unknown>): void {
+    this.log('ERROR', event, fields);
+  }
+
+  private log(level: string, event: string, fields?: Record<string, unknown>): void {
+    const suffix = fields && Object.keys(fields).length ? ` ${JSON.stringify(fields)}` : '';
+    console.log(`${level} ${event}${suffix}`);
   }
 }

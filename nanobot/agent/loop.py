@@ -8,6 +8,7 @@ import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -50,6 +51,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _WEIXIN_RUNTIME_TIME_IDLE_SECONDS = 10 * 60
 
     def __init__(
         self,
@@ -186,6 +188,24 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+
+    def _should_include_runtime_time(self, channel: str, session: Session) -> bool:
+        """Return whether the current turn should include runtime time context."""
+        if channel != "weixin":
+            return True
+        if not session.messages:
+            return False
+
+        last_timestamp = session.messages[-1].get("timestamp")
+        if not isinstance(last_timestamp, str) or not last_timestamp:
+            return False
+
+        try:
+            last_dt = datetime.fromisoformat(last_timestamp)
+        except ValueError:
+            return False
+
+        return (datetime.now() - last_dt).total_seconds() >= self._WEIXIN_RUNTIME_TIME_IDLE_SECONDS
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -544,6 +564,7 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
+                include_runtime_time=self._should_include_runtime_time(channel, session),
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
@@ -587,6 +608,7 @@ class AgentLoop:
             extra_sections=extra_sections,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            include_runtime_time=self._should_include_runtime_time(msg.channel, session),
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
