@@ -145,8 +145,6 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
     def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str()}"]
-        if channel and chat_id:
-            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -171,17 +169,21 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        include_runtime_time: bool = True,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
-        if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
+        if include_runtime_time:
+            runtime_ctx = self._build_runtime_context(channel, chat_id)
+            if isinstance(user_content, str):
+                merged = f"{runtime_ctx}\n\n{user_content}"
+            else:
+                merged = [{"type": "text", "text": runtime_ctx}] + user_content
         else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+            merged = user_content
 
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names, extra_sections)},

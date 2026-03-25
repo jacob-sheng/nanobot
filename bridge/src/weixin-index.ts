@@ -15,8 +15,12 @@ const QR_PATH = process.env.WEIXIN_QR_PATH || join(homedir(), 'weixin-qr.png');
 const NANOBOT_BIN = process.env.WEIXIN_NANOBOT_BIN || 'nanobot';
 const GATEWAY_SERVICE = process.env.WEIXIN_GATEWAY_SERVICE || 'nanobot-gateway.service';
 
-console.log('🐈 nanobot Weixin Bridge');
-console.log('========================\n');
+function log(level: string, event: string, fields?: Record<string, unknown>): void {
+  const suffix = fields && Object.keys(fields).length ? ` ${JSON.stringify(fields)}` : '';
+  console.log(`${level} ${event}${suffix}`);
+}
+
+log('INFO', 'bridge.process_start', { port: PORT, authDir: AUTH_DIR, loginMode: LOGIN_MODE });
 
 const server = new WeixinBridgeServer(
   PORT,
@@ -31,17 +35,34 @@ const server = new WeixinBridgeServer(
 );
 
 process.on('SIGINT', async () => {
-  console.log('\n\nShutting down...');
+  log('INFO', 'bridge.signal', { signal: 'SIGINT' });
   await server.stop();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
+  log('INFO', 'bridge.signal', { signal: 'SIGTERM' });
   await server.stop();
   process.exit(0);
 });
 
+process.on('unhandledRejection', (reason) => {
+  log('ERROR', 'bridge.unhandled_rejection', { reason: String(reason) });
+  process.exit(1);
+});
+
+process.on('uncaughtException', (error) => {
+  log('ERROR', 'bridge.uncaught_exception', {
+    name: error.name,
+    message: error.message,
+  });
+  process.exit(1);
+});
+
 server.start().catch((error) => {
-  console.error('Failed to start Weixin bridge:', error);
+  log('ERROR', 'bridge.start_failed', {
+    name: error instanceof Error ? error.name : 'Error',
+    message: error instanceof Error ? error.message : String(error),
+  });
   process.exit(1);
 });

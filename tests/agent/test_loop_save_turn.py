@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
 from nanobot.session.manager import Session
@@ -6,7 +8,64 @@ from nanobot.session.manager import Session
 def _mk_loop() -> AgentLoop:
     loop = AgentLoop.__new__(AgentLoop)
     loop._TOOL_RESULT_MAX_CHARS = AgentLoop._TOOL_RESULT_MAX_CHARS
+    loop._WEIXIN_RUNTIME_TIME_IDLE_SECONDS = AgentLoop._WEIXIN_RUNTIME_TIME_IDLE_SECONDS
     return loop
+
+
+def test_weixin_runtime_time_is_skipped_for_new_session() -> None:
+    loop = _mk_loop()
+    session = Session(key="weixin:test")
+
+    assert loop._should_include_runtime_time("weixin", session) is False
+
+
+def test_weixin_runtime_time_is_skipped_within_idle_window() -> None:
+    loop = _mk_loop()
+    session = Session(key="weixin:test")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "recent",
+            "timestamp": (datetime.now() - timedelta(minutes=5)).isoformat(),
+        }
+    )
+
+    assert loop._should_include_runtime_time("weixin", session) is False
+
+
+def test_weixin_runtime_time_is_included_after_idle_window() -> None:
+    loop = _mk_loop()
+    session = Session(key="weixin:test")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "older",
+            "timestamp": (datetime.now() - timedelta(minutes=11)).isoformat(),
+        }
+    )
+
+    assert loop._should_include_runtime_time("weixin", session) is True
+
+
+def test_weixin_runtime_time_is_skipped_on_invalid_timestamp() -> None:
+    loop = _mk_loop()
+    session = Session(key="weixin:test")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "bad-ts",
+            "timestamp": "not-a-timestamp",
+        }
+    )
+
+    assert loop._should_include_runtime_time("weixin", session) is False
+
+
+def test_non_weixin_runtime_time_stays_enabled() -> None:
+    loop = _mk_loop()
+    session = Session(key="telegram:test")
+
+    assert loop._should_include_runtime_time("telegram", session) is True
 
 
 def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
