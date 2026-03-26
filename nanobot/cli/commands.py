@@ -570,12 +570,17 @@ def gateway(
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
+
+        async def _silent_progress(_content: str, *, tool_hint: bool = False) -> None:
+            return None
+
         try:
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                on_progress=None if job.payload.send_progress else _silent_progress,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
@@ -1245,6 +1250,7 @@ def weixin_bridge(
         "BRIDGE_PORT": "3002",
         "AUTH_DIR": str(_weixin_state_dir(config)),
         "WEIXIN_BASE_URL": base_url or "https://ilinkai.weixin.qq.com",
+        "WEIXIN_CONFIG_PATH": str(_resolve_config_path_for_runtime(config)),
     }
     if bridge_token:
         env["BRIDGE_TOKEN"] = bridge_token
