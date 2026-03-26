@@ -1,5 +1,6 @@
+import crypto from 'crypto';
 import { spawnSync } from 'child_process';
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { basename, extname, join } from 'path';
 import qrcode from 'qrcode-terminal';
@@ -7,7 +8,20 @@ import QRCode from 'qrcode';
 import { WebSocketServer, WebSocket } from 'ws';
 
 import { WeixinAccountStore, SavedWeixinAccount } from './weixin-auth.js';
-import { downloadMedia, fetchQrCode, getUpdates, pollQrStatus, sendMessage, WeixinMessage, WeixinMessageItem } from './weixin-api.js';
+import {
+  downloadMedia,
+  encryptAesEcb,
+  fetchQrCode,
+  getUpdates,
+  getUploadUrl,
+  pollQrStatus,
+  sendBotMessage,
+  sendMessage,
+  uploadEncryptedMedia,
+  WeixinApiError,
+  WeixinMessage,
+  WeixinMessageItem,
+} from './weixin-api.js';
 
 interface BridgeEvents {
   onMessage: (msg: InboundWeixinMessage) => void;
@@ -28,6 +42,7 @@ interface SendCommand {
   type: 'send';
   to: string;
   text: string;
+  media?: string[];
 }
 
 interface BridgeHeartbeat {
@@ -112,6 +127,8 @@ function guessImageExtension(url: string, contentType: string | null): string {
 
 export class WeixinBridgeServer {
   private static readonly HEARTBEAT_INTERVAL_MS = 15000;
+  private static readonly SESSION_EXPIRED_ERRCODE = -14;
+  private static readonly SESSION_PAUSE_MS = 60 * 60 * 1000;
   private wss: WebSocketServer | null = null;
   private clients = new Set<WebSocket>();
   private store: WeixinAccountStore;
@@ -119,6 +136,7 @@ export class WeixinBridgeServer {
   private contextTokens = new Map<string, string>();
   private monitorTasks = new Map<string, Promise<void>>();
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private sessionPauseUntil = new Map<string, number>();
   private stopped = false;
 
   constructor(
@@ -131,6 +149,8 @@ export class WeixinBridgeServer {
     private readonly qrPath?: string,
     private readonly nanobotBin?: string,
     private readonly gatewayService?: string,
+    private readonly routeTag?: string,
+    private readonly cdnBaseUrl = 'https://novac2c.cdn.weixin.qq.com/c2c',
   ) {
     this.store = new WeixinAccountStore(authDir);
   }
@@ -172,8 +192,15 @@ export class WeixinBridgeServer {
 
     for (const account of saved) {
       this.accounts.set(account.accountId, account);
+      for (const [userId, contextToken] of Object.entries(account.contextTokens || {})) {
+        this.contextTokens.set(this.contextKey(account.accountId, userId), contextToken);
+      }
       this.startMonitor(account);
     }
+  }
+
+  private contextKey(accountId: string, userId: string): string {
+    return `${accountId}:${userId}`;
   }
 
   private setupClient(ws: WebSocket): void {
@@ -334,8 +361,18 @@ export class WeixinBridgeServer {
     let timeoutMs = 35000;
 
     while (!this.stopped) {
+      const pauseUntil = this.sessionPauseUntil.get(account.accountId) || 0;
+      if (pauseUntil > Date.now()) {
+        const waitMs = pauseUntil - Date.now();
+        this.logWarning('weixin.monitor_session_paused', {
+          accountId: account.accountId,
+          waitSeconds: Math.ceil(waitMs / 1000),
+        });
+        await sleep(waitMs);
+        continue;
+      }
       try {
-        const response = await getUpdates(account.baseUrl, account.token, cursor, timeoutMs);
+        const response = await getUpdates(account.baseUrl, account.token, cursor, timeoutMs, this.routeTag);
         if (response.get_updates_buf) {
           cursor = response.get_updates_buf;
           await this.store.saveSyncCursor(account.accountId, cursor);
@@ -344,8 +381,21 @@ export class WeixinBridgeServer {
           timeoutMs = response.longpolling_timeout_ms;
         }
         if ((response.ret ?? 0) !== 0 || (response.errcode ?? 0) !== 0) {
-          const detail = `${response.errmsg || response.errcode || response.ret}`;
-          this.logWarning('weixin.getupdates_failed', { accountId: account.accountId, detail });
+          const errcode = response.errcode ?? 0;
+          const ret = response.ret ?? 0;
+          const detail = `${response.errmsg || errcode || ret}`;
+          if (errcode === WeixinBridgeServer.SESSION_EXPIRED_ERRCODE || ret === WeixinBridgeServer.SESSION_EXPIRED_ERRCODE) {
+            this.sessionPauseUntil.set(account.accountId, Date.now() + WeixinBridgeServer.SESSION_PAUSE_MS);
+            this.logWarning('weixin.monitor_session_expired', { accountId: account.accountId, errcode, ret, detail });
+            this.broadcast({
+              type: 'status',
+              status: 'disconnected',
+              accountId: account.accountId,
+              detail: 'session_expired',
+            });
+            continue;
+          }
+          this.logWarning('weixin.monitor_api_error', { accountId: account.accountId, errcode, ret, detail });
           this.broadcast({
             type: 'error',
             error: `weixin getupdates failed for ${account.accountId}: ${detail}`,
@@ -358,7 +408,8 @@ export class WeixinBridgeServer {
           await this.handleInboundMessage(account, msg);
         }
       } catch (error) {
-        this.logWarning('weixin.monitor_error', {
+        const event = this.classifyMonitorError(error);
+        this.logWarning(event, {
           accountId: account.accountId,
           error: this.errorDetail(error),
         });
@@ -366,12 +417,26 @@ export class WeixinBridgeServer {
           type: 'status',
           status: 'disconnected',
           accountId: account.accountId,
-          detail: String(error),
+          detail: event,
         });
         await sleep(5000);
       }
     }
     this.logInfo('weixin.monitor_stopped', { accountId: account.accountId });
+  }
+
+  private classifyMonitorError(error: unknown): string {
+    if (error instanceof WeixinApiError) {
+      if (error.errcode === WeixinBridgeServer.SESSION_EXPIRED_ERRCODE || error.ret === WeixinBridgeServer.SESSION_EXPIRED_ERRCODE) {
+        return 'weixin.monitor_session_expired';
+      }
+      return 'weixin.monitor_api_error';
+    }
+    const detail = this.errorDetail(error).toLowerCase();
+    if (/fetch failed|econn|etimedout|network|socket|connect|abort/.test(detail)) {
+      return 'weixin.monitor_network_error';
+    }
+    return 'weixin.monitor_error';
   }
 
   private extractMediaUrls(msg: WeixinMessage, kind: 'image' | 'file'): string[] {
@@ -410,7 +475,7 @@ export class WeixinBridgeServer {
 
     for (const [index, url] of urls.entries()) {
       try {
-        const { data, contentType } = await downloadMedia(url, account.token);
+        const { data, contentType } = await downloadMedia(url, account.token, 20000, this.routeTag);
         const ext = guessImageExtension(url, contentType);
         const filename = `${accountPart}_${senderPart}_${stamp}_${index + 1}${ext}`;
         const fullPath = join(this.mediaDir(), filename);
@@ -436,7 +501,11 @@ export class WeixinBridgeServer {
     if (!finalContent && media.length === 0) return;
 
     if (msg.context_token) {
-      this.contextTokens.set(`${account.accountId}:${sender}`, msg.context_token);
+      this.contextTokens.set(this.contextKey(account.accountId, sender), msg.context_token);
+      const updated = await this.store.setContextToken(account.accountId, sender, msg.context_token);
+      if (updated) {
+        this.accounts.set(account.accountId, updated);
+      }
     }
 
     if (media.length) {
@@ -466,14 +535,156 @@ export class WeixinBridgeServer {
       throw new Error(`Unknown Weixin account: ${accountId}`);
     }
 
-    const contextToken = this.contextTokens.get(`${accountId}:${toUserId}`);
+    const contextToken = this.contextTokens.get(this.contextKey(accountId, toUserId));
     if (!contextToken) {
       throw new Error(`No Weixin context token cached for ${toUserId} on ${accountId}`);
     }
 
-    this.logInfo('weixin.send_attempt', { accountId, toUserId });
-    await sendMessage(account.baseUrl, account.token, toUserId, cmd.text, contextToken);
-    this.logInfo('weixin.send_success', { accountId, toUserId });
+    const media = (cmd.media || []).map((item) => String(item).trim()).filter(Boolean);
+    const failedMedia: string[] = [];
+
+    for (const mediaPath of media) {
+      try {
+        await this.sendMediaFile(account, toUserId, mediaPath, contextToken);
+      } catch (error) {
+        const event = await this.handleSendFailure(accountId, toUserId, error);
+        this.logWarning(event, {
+          accountId,
+          toUserId,
+          mediaPath,
+          error: this.errorDetail(error),
+        });
+        failedMedia.push(basename(mediaPath));
+        if (event === 'weixin.send_invalid_context_token' || event === 'weixin.send_session_expired') {
+          throw error;
+        }
+      }
+    }
+
+    if (cmd.text.trim()) {
+      this.logInfo('weixin.send_attempt', { accountId, toUserId });
+      await sendMessage(account.baseUrl, account.token, toUserId, cmd.text, contextToken, this.routeTag);
+      this.logInfo('weixin.send_success', { accountId, toUserId });
+    }
+
+    if (failedMedia.length) {
+      const note = `[Media send failed: ${failedMedia.join(', ')}]`;
+      await sendMessage(account.baseUrl, account.token, toUserId, note, contextToken, this.routeTag);
+      this.logWarning('weixin.send_media_partial_failure', {
+        accountId,
+        toUserId,
+        count: failedMedia.length,
+      });
+    }
+  }
+
+  private async handleSendFailure(accountId: string, toUserId: string, error: unknown): Promise<string> {
+    if (error instanceof WeixinApiError) {
+      if (error.errcode === WeixinBridgeServer.SESSION_EXPIRED_ERRCODE || error.ret === WeixinBridgeServer.SESSION_EXPIRED_ERRCODE) {
+        this.sessionPauseUntil.set(accountId, Date.now() + WeixinBridgeServer.SESSION_PAUSE_MS);
+        return 'weixin.send_session_expired';
+      }
+      const detail = `${error.errmsg || error.message}`.toLowerCase();
+      if (/agent session|context token|context_token|invalid session/.test(detail)) {
+        this.contextTokens.delete(this.contextKey(accountId, toUserId));
+        const updated = await this.store.clearContextToken(accountId, toUserId);
+        if (updated) {
+          this.accounts.set(accountId, updated);
+        }
+        return 'weixin.send_invalid_context_token';
+      }
+      return 'weixin.send_api_error';
+    }
+
+    if (/no weixin context token cached/i.test(this.errorDetail(error))) {
+      return 'weixin.send_missing_context_token';
+    }
+    return 'weixin.send_error';
+  }
+
+  private async sendMediaFile(
+    account: SavedWeixinAccount,
+    toUserId: string,
+    mediaPath: string,
+    contextToken: string,
+  ): Promise<void> {
+    const rawData = await readFile(mediaPath);
+    const fileSize = rawData.length;
+    const fileMd5 = crypto.createHash('md5').update(rawData).digest('hex');
+    const fileKey = crypto.randomBytes(16).toString('hex');
+    const aesKeyRaw = crypto.randomBytes(16);
+    const aesKeyHex = aesKeyRaw.toString('hex');
+    const encryptedData = encryptAesEcb(rawData, aesKeyRaw);
+    const paddedSize = Math.ceil((fileSize + 1) / 16) * 16;
+    const ext = extname(mediaPath).toLowerCase();
+
+    let mediaType = 3;
+    let itemType = 4;
+    let itemKey = 'file_item';
+    if (['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.ico', '.svg', '.heic'].includes(ext)) {
+      mediaType = 1;
+      itemType = 2;
+      itemKey = 'image_item';
+    } else if (['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv'].includes(ext)) {
+      mediaType = 2;
+      itemType = 5;
+      itemKey = 'video_item';
+    }
+
+    const upload = await getUploadUrl(
+      account.baseUrl,
+      account.token,
+      {
+        filekey: fileKey,
+        media_type: mediaType,
+        to_user_id: toUserId,
+        rawsize: fileSize,
+        rawfilemd5: fileMd5,
+        filesize: paddedSize,
+        no_need_thumb: true,
+        aeskey: aesKeyHex,
+      },
+      this.routeTag,
+    );
+    const downloadParam = await uploadEncryptedMedia(upload.upload_param, fileKey, encryptedData, this.cdnBaseUrl);
+    const cdnAesKeyB64 = Buffer.from(aesKeyHex, 'utf-8').toString('base64');
+
+    const mediaItem: Record<string, unknown> = {
+      media: {
+        encrypt_query_param: downloadParam,
+        aes_key: cdnAesKeyB64,
+        encrypt_type: 1,
+      },
+    };
+    if (itemType === 2) {
+      mediaItem.mid_size = paddedSize;
+    } else if (itemType === 5) {
+      mediaItem.video_size = paddedSize;
+    } else {
+      mediaItem.file_name = basename(mediaPath);
+      mediaItem.len = String(fileSize);
+    }
+
+    await sendBotMessage(
+      account.baseUrl,
+      account.token,
+      {
+        from_user_id: '',
+        to_user_id: toUserId,
+        client_id: `nanobot-${Date.now()}-${fileKey.slice(0, 8)}`,
+        message_type: 2,
+        message_state: 2,
+        context_token: contextToken,
+        item_list: [{ type: itemType, [itemKey]: mediaItem }],
+      },
+      this.routeTag,
+    );
+    this.logInfo('weixin.send_media_success', {
+      accountId: account.accountId,
+      toUserId,
+      mediaPath,
+      itemKey,
+    });
   }
 
   async stop(): Promise<void> {
