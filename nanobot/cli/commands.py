@@ -1245,6 +1245,7 @@ def weixin_bridge(
         "BRIDGE_PORT": "3002",
         "AUTH_DIR": str(_weixin_state_dir(config)),
         "WEIXIN_BASE_URL": base_url or "https://ilinkai.weixin.qq.com",
+        "WEIXIN_CONFIG_PATH": str(_resolve_config_path_for_runtime(config)),
     }
     if bridge_token:
         env["BRIDGE_TOKEN"] = bridge_token
