@@ -27,6 +27,7 @@ class WeixinConfig(Base):
     typing_enabled: bool = True
     media_enabled: bool = True
     allow_from: list[str] = Field(default_factory=list)
+    route_tag: str | int | None = None
 
 
 class WeixinChannel(BaseChannel):
@@ -100,6 +101,8 @@ class WeixinChannel(BaseChannel):
             "to": msg.chat_id,
             "text": msg.content,
         }
+        if msg.media is not None:
+            payload["media"] = [str(item) for item in msg.media if str(item).strip()]
         for attempt in range(2):
             if not await self._wait_for_connection():
                 logger.warning(
