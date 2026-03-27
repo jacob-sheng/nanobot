@@ -32,6 +32,12 @@ def test_format_timing_cron_without_tz(tmp_path) -> None:
     assert tool._format_timing(s) == "cron: */5 * * * *"
 
 
+def test_format_timing_daily_random(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    s = CronSchedule(kind="daily_random", window_start="08:00", window_end="20:00", tz="Asia/Shanghai")
+    assert tool._format_timing(s) == "daily random: 08:00-20:00 (Asia/Shanghai)"
+
+
 def test_format_timing_every_hours(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     s = CronSchedule(kind="every", every_ms=7_200_000)
@@ -146,6 +152,46 @@ def test_list_cron_job_shows_expression_and_timezone(tmp_path) -> None:
     )
     result = tool._list_jobs()
     assert "cron: 0 9 * * 1-5 (America/Denver)" in result
+
+
+def test_list_daily_random_job_shows_window_and_timezone(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Surprise share",
+        schedule=CronSchedule(
+            kind="daily_random",
+            window_start="08:00",
+            window_end="20:00",
+            tz="Asia/Shanghai",
+        ),
+        message="share",
+    )
+    result = tool._list_jobs()
+    assert "daily random: 08:00-20:00 (Asia/Shanghai)" in result
+
+
+def test_list_job_shows_silent_progress_flag(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Quiet background share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="share",
+        send_progress=False,
+    )
+    result = tool._list_jobs()
+    assert "silent progress" in result
+
+
+def test_list_job_shows_weixin_mirror_flag(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Dual share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="share",
+        mirror_weixin_allowfrom=True,
+    )
+    result = tool._list_jobs()
+    assert "weixin mirror" in result
 
 
 def test_list_every_job_shows_human_interval(tmp_path) -> None:
@@ -271,6 +317,40 @@ def test_add_cron_job_defaults_to_tool_timezone(tmp_path) -> None:
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
     assert job.schedule.tz == "Asia/Shanghai"
+
+
+def test_add_daily_random_job_defaults_to_tool_timezone(tmp_path) -> None:
+    tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+    tool.set_context("telegram", "chat-1")
+
+    result = tool._add_job("Random share", None, None, None, None, "08:00", "20:00")
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    assert job.schedule.kind == "daily_random"
+    assert job.schedule.tz == "Asia/Shanghai"
+    assert job.schedule.window_start == "08:00"
+    assert job.schedule.window_end == "20:00"
+
+
+def test_add_job_can_disable_progress(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context("telegram", "chat-1")
+
+    result = tool._add_job(
+        "Quiet share",
+        None,
+        None,
+        None,
+        None,
+        "08:00",
+        "20:00",
+        send_progress=False,
+    )
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    assert job.payload.send_progress is False
 
 
 def test_add_at_job_uses_default_timezone_for_naive_datetime(tmp_path) -> None:

@@ -1,6 +1,8 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
+import time
 from contextlib import contextmanager, nullcontext
 
 import os
@@ -22,6 +24,7 @@ if sys.platform == "win32":
             pass
 
 import typer
+from loguru import logger
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
@@ -491,6 +494,301 @@ def _migrate_cron_store(config: "Config") -> None:
         shutil.move(str(legacy_path), str(new_path))
 
 
+_MASTODON_DAILY_SHARE_SENTINEL = "NO_SHARE"
+_BILIBILI_LOGIN_REQUIRED_PREFIX = "LOGIN_REQUIRED:"
+_BILIBILI_LOGIN_REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+
+def _is_mastodon_daily_share_job(job) -> bool:
+    """Return True for Mastodon daily-share jobs, including temporary smoke runs."""
+    return job.name.startswith("mastodon_daily_share")
+
+
+def _is_bilibili_daily_share_job(job) -> bool:
+    """Return True for Bilibili daily-share jobs, including temporary smoke runs."""
+    return job.name.startswith("bilibili_daily_share")
+
+
+def _is_curated_daily_share_job(job) -> bool:
+    """Return whether a job uses the quiet curated-share callback path."""
+    return _is_mastodon_daily_share_job(job) or _is_bilibili_daily_share_job(job)
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Extract and lightly clean URLs from a response body."""
+    import re
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"https?://\S+", text or ""):
+        cleaned = match.rstrip(")]}>,.!?\"'，。；：")
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            urls.append(cleaned)
+    return urls
+
+
+def _extract_bilibili_bvids(text: str) -> list[str]:
+    """Extract canonical BV ids from a response body."""
+    import re
+
+    bvids: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"\bBV[0-9A-Za-z]{10}\b", text or ""):
+        if match not in seen:
+            seen.add(match)
+            bvids.append(match)
+    return bvids
+
+
+def _mark_mastodon_daily_share_links(response: str, workspace_path: Path) -> list[str]:
+    """Mark shared Mastodon posts based on URLs present in the final response."""
+    import json
+    import subprocess
+
+    script = workspace_path / "skills" / "mastodon-daily-share" / "scripts" / "mastodon_daily_share.py"
+    urls = set(_extract_urls(response))
+    if not urls:
+        return []
+
+    prepare_cmd = [sys.executable, str(script), "prepare", "--limit", "20"]
+    prepare_proc = subprocess.run(
+        prepare_cmd,
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True,
+    )
+    if prepare_proc.returncode != 0:
+        logger.warning(
+            "Mastodon daily share: failed to reload candidates for mark-shared: {}",
+            prepare_proc.stderr.strip() or prepare_proc.stdout.strip(),
+        )
+        return []
+
+    try:
+        payload = json.loads(prepare_proc.stdout.strip() or "{}")
+    except Exception:
+        logger.warning("Mastodon daily share: failed to parse prepare output for mark-shared")
+        return []
+
+    status_ids: list[str] = []
+    seen_status_ids: set[str] = set()
+    for item in payload.get("candidates", []):
+        url = str(item.get("url") or "").strip()
+        status_id = str(item.get("status_id") or "").strip()
+        if not url or not status_id:
+            continue
+        if url not in urls or status_id in seen_status_ids:
+            continue
+        seen_status_ids.add(status_id)
+        status_ids.append(status_id)
+
+    if not status_ids:
+        logger.warning("Mastodon daily share: no candidate IDs matched final response URLs")
+        return []
+
+    mark_cmd = [sys.executable, str(script), "mark-shared"]
+    for status_id in status_ids:
+        mark_cmd.extend(["--status-id", status_id])
+    mark_proc = subprocess.run(
+        mark_cmd,
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True,
+    )
+    if mark_proc.returncode != 0:
+        logger.warning(
+            "Mastodon daily share: failed to mark shared IDs {}: {}",
+            status_ids,
+            mark_proc.stderr.strip() or mark_proc.stdout.strip(),
+        )
+        return []
+
+    logger.info("Mastodon daily share: marked shared IDs {}", status_ids)
+    return status_ids
+
+
+def _load_bilibili_prepare_cache(workspace_path: Path) -> dict[str, Any]:
+    """Load the most recent Bilibili prepare cache written for callback matching."""
+    cache_path = workspace_path / "services" / "bilibili-daily-share" / "last_prepare.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Bilibili daily share: failed to parse {}", cache_path)
+        return {}
+
+
+def _collect_bilibili_daily_share_bvids(response: str, workspace_path: Path) -> list[str]:
+    """Collect canonical BVIDs referenced by the final response."""
+    payload = _load_bilibili_prepare_cache(workspace_path)
+    urls = set(_extract_urls(response))
+    bvids_in_response = set(_extract_bilibili_bvids(response))
+    if not urls and not bvids_in_response:
+        return []
+
+    matched: list[str] = []
+    seen: set[str] = set()
+    for item in payload.get("candidates", []):
+        bvid = str(item.get("bvid") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not bvid or bvid in seen:
+            continue
+        if url in urls or bvid in bvids_in_response:
+            seen.add(bvid)
+            matched.append(bvid)
+    return matched
+
+
+def _mark_bilibili_daily_share_bvids(workspace_path: Path, bvids: list[str]) -> list[str]:
+    """Mark shared Bilibili videos by canonical BVID."""
+    import subprocess
+
+    bvids = [str(item).strip() for item in bvids if str(item).strip()]
+    if not bvids:
+        return []
+
+    script = workspace_path / "skills" / "bilibili-daily-share" / "scripts" / "bilibili_daily_share.py"
+    mark_cmd = [sys.executable, str(script), "mark-shared"]
+    for bvid in bvids:
+        mark_cmd.extend(["--bvid", bvid])
+
+    mark_proc = subprocess.run(
+        mark_cmd,
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True,
+    )
+    if mark_proc.returncode != 0:
+        logger.warning(
+            "Bilibili daily share: failed to mark shared BVIDs {}: {}",
+            bvids,
+            mark_proc.stderr.strip() or mark_proc.stdout.strip(),
+        )
+        return []
+
+    logger.info("Bilibili daily share: marked shared BVIDs {}", bvids)
+    return bvids
+
+
+def _mark_bilibili_login_reminder(workspace_path: Path, *, at_ms: int | None = None) -> int:
+    """Persist the last Bilibili login reminder timestamp."""
+    when_ms = int(at_ms if at_ms is not None else time.time() * 1000)
+    state_path = workspace_path / "services" / "bilibili-daily-share" / "state.json"
+    payload: dict[str, Any]
+    if state_path.exists():
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+
+    payload.setdefault("version", 1)
+    payload.setdefault("shared_video_ids", [])
+    payload.setdefault("aid_aliases", {})
+    payload["last_login_reminder_at_ms"] = when_ms
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return when_ms
+
+
+async def _mirror_weixin_share_if_enabled(job, response: str, *, config_path: Path | None = None) -> dict[str, str]:
+    """Mirror a final share message to Weixin allowFrom targets when enabled."""
+    if not job.payload.mirror_weixin_allowfrom:
+        return {}
+
+    from nanobot.config.loader import get_config_path
+    from nanobot.utils.weixin_broadcast import send_weixin_broadcast_async
+
+    target_config_path = config_path or get_config_path()
+    try:
+        results = await send_weixin_broadcast_async(response, config_path=target_config_path)
+    except Exception as exc:
+        logger.warning("Weixin mirror failed for cron job '{}': {}", job.name, exc)
+        return {}
+
+    sent = [recipient for recipient, status in results.items() if status == "sent"]
+    failed = {recipient: status for recipient, status in results.items() if status != "sent"}
+    if sent:
+        logger.info("Weixin mirror sent for cron job '{}' to {}", job.name, sent)
+    if failed:
+        logger.warning("Weixin mirror partial failures for cron job '{}': {}", job.name, failed)
+    return results
+
+
+async def _handle_curated_daily_share_response(
+    job,
+    response: str,
+    *,
+    bus,
+    workspace_path: Path,
+    config_path: Path | None = None,
+) -> None:
+    """Handle curated share jobs with custom suppress/deliver/mark semantics."""
+    from nanobot.bus.events import OutboundMessage
+
+    response = (response or "").strip()
+    if not response:
+        return
+
+    if _is_mastodon_daily_share_job(job):
+        if response == _MASTODON_DAILY_SHARE_SENTINEL:
+            logger.info("Mastodon daily share: nothing worth sending today")
+            return
+        if not _extract_urls(response):
+            logger.warning("Mastodon daily share: suppressing response without shareable URLs")
+            return
+
+        await bus.publish_outbound(OutboundMessage(
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+            content=response,
+        ))
+        try:
+            await _mirror_weixin_share_if_enabled(job, response, config_path=config_path)
+        except Exception as exc:
+            logger.warning("Mastodon daily share: unexpected Weixin mirror error: {}", exc)
+        _mark_mastodon_daily_share_links(response, workspace_path)
+        return
+
+    if _is_bilibili_daily_share_job(job):
+        if response == _MASTODON_DAILY_SHARE_SENTINEL:
+            logger.info("Bilibili daily share: nothing worth sending today")
+            return
+        if response.startswith(_BILIBILI_LOGIN_REQUIRED_PREFIX):
+            reminder_text = response[len(_BILIBILI_LOGIN_REQUIRED_PREFIX):].strip()
+            if not reminder_text:
+                logger.warning("Bilibili daily share: suppressing empty login reminder")
+                return
+            await bus.publish_outbound(OutboundMessage(
+                channel=job.payload.channel or "cli",
+                chat_id=job.payload.to or "direct",
+                content=reminder_text,
+            ))
+            _mark_bilibili_login_reminder(workspace_path)
+            return
+
+        matched_bvids = _collect_bilibili_daily_share_bvids(response, workspace_path)
+        if not matched_bvids:
+            logger.warning("Bilibili daily share: suppressing response without matchable video URL/BVID")
+            return
+
+        await bus.publish_outbound(OutboundMessage(
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+            content=response,
+        ))
+        try:
+            await _mirror_weixin_share_if_enabled(job, response, config_path=config_path)
+        except Exception as exc:
+            logger.warning("Bilibili daily share: unexpected Weixin mirror error: {}", exc)
+        _mark_bilibili_daily_share_bvids(workspace_path, matched_bvids)
+        return
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -570,21 +868,36 @@ def gateway(
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
+
+        async def _silent_progress(_content: str, *, tool_hint: bool = False) -> None:
+            return None
+
         try:
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                on_progress=None if job.payload.send_progress else _silent_progress,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
-        response = resp.content if resp else ""
+        response = (resp.content if resp else "").strip()
 
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+            return response
+
+        if _is_curated_daily_share_job(job):
+            if response and job.payload.deliver and job.payload.to:
+                await _handle_curated_daily_share_response(
+                    job,
+                    response,
+                    bus=bus,
+                    workspace_path=config.workspace_path,
+                )
             return response
 
         if job.payload.deliver and job.payload.to and response:
@@ -1245,6 +1558,7 @@ def weixin_bridge(
         "BRIDGE_PORT": "3002",
         "AUTH_DIR": str(_weixin_state_dir(config)),
         "WEIXIN_BASE_URL": base_url or "https://ilinkai.weixin.qq.com",
+        "WEIXIN_CONFIG_PATH": str(_resolve_config_path_for_runtime(config)),
     }
     if bridge_token:
         env["BRIDGE_TOKEN"] = bridge_token
