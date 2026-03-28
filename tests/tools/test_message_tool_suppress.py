@@ -86,6 +86,46 @@ class TestMessageToolSuppressLogic:
         assert result is not None
         assert "Hello" in result.content
 
+    @pytest.mark.asyncio
+    async def test_empty_final_reply_surfaces_latest_tool_result(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="exec", arguments={"command": "echo ok"})
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value='{"task_id":"abc","status":"pending"}')
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="run")
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        assert "Latest tool result" in result.content
+        assert '"task_id":"abc"' in result.content
+
+    @pytest.mark.asyncio
+    async def test_empty_final_reply_surfaces_guard_reason(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="exec", arguments={"command": "curl metadata"})
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(
+            return_value="Error: Command blocked by safety guard (metadata URL detected)"
+        )
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="run")
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        assert "safety guard blocked a command" in result.content
+        assert "metadata URL detected" in result.content
+
     async def test_progress_hides_internal_reasoning(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})

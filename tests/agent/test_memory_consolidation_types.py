@@ -10,8 +10,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+import nanobot.providers.base as provider_base
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.config.schema import MarkdownMemoryConfig
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
@@ -105,6 +107,63 @@ class TestMemoryConsolidationTypeHandling:
         memory_content = store.memory_file.read_text()
         parsed_mem = json.loads(memory_content)
         assert "User likes testing" in parsed_mem["facts"]
+
+    @pytest.mark.asyncio
+    async def test_history_callback_runs_after_successful_consolidation(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(
+                history_entry="[2026-01-01] User discussed testing.",
+                memory_update="# Memory\nUser likes testing.",
+            )
+        )
+        provider.chat_with_retry = provider.chat
+        callback = AsyncMock()
+
+        result = await store.consolidate(
+            _make_messages(message_count=60),
+            provider,
+            "test-model",
+            on_history_entry=callback,
+        )
+
+        assert result is True
+        callback.assert_awaited_once_with("[2026-01-01] User discussed testing.")
+
+    @pytest.mark.asyncio
+    async def test_markdown_disabled_skips_file_writes_but_keeps_callback(self, tmp_path: Path) -> None:
+        store = MemoryStore(
+            tmp_path,
+            markdown_config=MarkdownMemoryConfig(
+                enabled=False,
+                load_long_term_into_context=False,
+                persist_long_term=False,
+                persist_history=False,
+                audit_semantic_writes=False,
+            ),
+        )
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(
+                history_entry="[2026-01-01] User discussed testing.",
+                memory_update="# Memory\nUser likes testing.",
+            )
+        )
+        provider.chat_with_retry = provider.chat
+        callback = AsyncMock()
+
+        result = await store.consolidate(
+            _make_messages(message_count=60),
+            provider,
+            "test-model",
+            on_history_entry=callback,
+        )
+
+        assert result is True
+        callback.assert_awaited_once_with("[2026-01-01] User discussed testing.")
+        assert not store.memory_file.exists()
+        assert not store.history_file.exists()
 
     @pytest.mark.asyncio
     async def test_string_arguments_as_raw_json(self, tmp_path: Path) -> None:
@@ -344,7 +403,7 @@ class TestMemoryConsolidationTypeHandling:
         async def _fake_sleep(delay: int) -> None:
             delays.append(delay)
 
-        monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+        monkeypatch.setattr(provider_base.asyncio, "sleep", _fake_sleep)
 
         result = await store.consolidate(messages, provider, "test-model")
 

@@ -1,6 +1,8 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
+import time
 from contextlib import contextmanager, nullcontext
 
 import os
@@ -22,6 +24,7 @@ if sys.platform == "win32":
             pass
 
 import typer
+from loguru import logger
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
@@ -491,6 +494,342 @@ def _migrate_cron_store(config: "Config") -> None:
         shutil.move(str(legacy_path), str(new_path))
 
 
+_MASTODON_DAILY_SHARE_SENTINEL = "NO_SHARE"
+_BILIBILI_LOGIN_REQUIRED_PREFIX = "LOGIN_REQUIRED:"
+_BILIBILI_LOGIN_REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+
+def _is_mastodon_daily_share_job(job) -> bool:
+    """Return True for Mastodon daily-share jobs, including temporary smoke runs."""
+    return job.name.startswith("mastodon_daily_share")
+
+
+def _is_bilibili_daily_share_job(job) -> bool:
+    """Return True for Bilibili daily-share jobs, including temporary smoke runs."""
+    return job.name.startswith("bilibili_daily_share")
+
+
+def _is_curated_daily_share_job(job) -> bool:
+    """Return whether a job uses the quiet curated-share callback path."""
+    return _is_mastodon_daily_share_job(job) or _is_bilibili_daily_share_job(job)
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Extract and lightly clean URLs from a response body."""
+    import re
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"https?://\S+", text or ""):
+        cleaned = match.rstrip(")]}>,.!?\"'，。；：")
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            urls.append(cleaned)
+    return urls
+
+
+def _extract_bilibili_bvids(text: str) -> list[str]:
+    """Extract canonical BV ids from a response body."""
+    import re
+
+    bvids: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"\bBV[0-9A-Za-z]{10}\b", text or ""):
+        if match not in seen:
+            seen.add(match)
+            bvids.append(match)
+    return bvids
+
+
+def _load_mastodon_prepare_cache(workspace_path: Path) -> dict[str, Any]:
+    """Load the most recent Mastodon prepare cache written for callback matching."""
+    cache_path = workspace_path / "services" / "mastodon-daily-share" / "last_prepare.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Mastodon daily share: failed to parse {}", cache_path)
+        return {}
+
+
+def _extract_mastodon_status_ids(text: str) -> list[str]:
+    """Extract Mastodon status IDs from URLs in text.
+
+    Matches patterns like ``https://<domain>/@<user>/<numeric_id>``
+    which is the canonical Mastodon status URL format.
+    """
+    import re
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"https?://[^\s/]+/@[^\s/]+/(\d{15,25})", text or ""):
+        if match not in seen:
+            seen.add(match)
+            ids.append(match)
+    return ids
+
+
+def _collect_mastodon_daily_share_ids(response: str, workspace_path: Path) -> list[str]:
+    """Collect status IDs referenced by the final response.
+
+    Matching strategies (any hit is sufficient):
+    1. Mastodon URL regex — extract status IDs from ``/@user/<id>`` URLs
+    2. Reverse URL match — response URLs ∩ URLs embedded in candidate text/card
+    """
+    import re
+
+    payload = _load_mastodon_prepare_cache(workspace_path)
+    response_urls = set(_extract_urls(response))
+    status_ids_in_response = set(_extract_mastodon_status_ids(response))
+    if not response_urls and not status_ids_in_response:
+        return []
+
+    def _urls_in_text(text: str) -> set[str]:
+        return {m.rstrip(')]}>,. !?\"\',') for m in re.findall(r"https?://\S+", text or "")}
+
+    matched: list[str] = []
+    seen: set[str] = set()
+    for item in payload.get("candidates", []):
+        status_id = str(item.get("status_id") or "").strip()
+        status_url = str(item.get("url") or "").strip()
+        if not status_id or status_id in seen:
+            continue
+
+        # Strategy 1: Mastodon URL regex — status ID extracted from response URLs
+        if status_id in status_ids_in_response:
+            seen.add(status_id)
+            matched.append(status_id)
+            continue
+
+        # Strategy 2: reverse URL match — response URLs ∩ candidate embedded URLs
+        candidate_urls: set[str] = set()
+        if status_url:
+            candidate_urls.add(status_url)
+        candidate_urls.update(_urls_in_text(str(item.get("text") or "")))
+        card_url = str(item.get("card_url") or "").strip()
+        if card_url:
+            candidate_urls.add(card_url)
+        if response_urls & candidate_urls:
+            seen.add(status_id)
+            matched.append(status_id)
+
+    return matched
+
+
+def _mark_mastodon_daily_share_ids(workspace_path: Path, status_ids: list[str]) -> list[str]:
+    """Mark shared Mastodon posts by status ID."""
+    import subprocess
+
+    status_ids = [str(item).strip() for item in status_ids if str(item).strip()]
+    if not status_ids:
+        return []
+
+    script = workspace_path / "skills" / "mastodon-daily-share" / "scripts" / "mastodon_daily_share.py"
+    mark_cmd = [sys.executable, str(script), "mark-shared"]
+    for status_id in status_ids:
+        mark_cmd.extend(["--status-id", status_id])
+
+    mark_proc = subprocess.run(
+        mark_cmd,
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True,
+    )
+    if mark_proc.returncode != 0:
+        logger.warning(
+            "Mastodon daily share: failed to mark shared IDs {}: {}",
+            status_ids,
+            mark_proc.stderr.strip() or mark_proc.stdout.strip(),
+        )
+        return []
+
+    logger.info("Mastodon daily share: marked shared IDs {}", status_ids)
+    return status_ids
+
+def _load_bilibili_prepare_cache(workspace_path: Path) -> dict[str, Any]:
+    """Load the most recent Bilibili prepare cache written for callback matching."""
+    cache_path = workspace_path / "services" / "bilibili-daily-share" / "last_prepare.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Bilibili daily share: failed to parse {}", cache_path)
+        return {}
+
+
+def _collect_bilibili_daily_share_bvids(response: str, workspace_path: Path) -> list[str]:
+    """Collect canonical BVIDs referenced by the final response."""
+    payload = _load_bilibili_prepare_cache(workspace_path)
+    urls = set(_extract_urls(response))
+    bvids_in_response = set(_extract_bilibili_bvids(response))
+    if not urls and not bvids_in_response:
+        return []
+
+    matched: list[str] = []
+    seen: set[str] = set()
+    for item in payload.get("candidates", []):
+        bvid = str(item.get("bvid") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not bvid or bvid in seen:
+            continue
+        if url in urls or bvid in bvids_in_response:
+            seen.add(bvid)
+            matched.append(bvid)
+    return matched
+
+
+def _mark_bilibili_daily_share_bvids(workspace_path: Path, bvids: list[str]) -> list[str]:
+    """Mark shared Bilibili videos by canonical BVID."""
+    import subprocess
+
+    bvids = [str(item).strip() for item in bvids if str(item).strip()]
+    if not bvids:
+        return []
+
+    script = workspace_path / "skills" / "bilibili-daily-share" / "scripts" / "bilibili_daily_share.py"
+    mark_cmd = [sys.executable, str(script), "mark-shared"]
+    for bvid in bvids:
+        mark_cmd.extend(["--bvid", bvid])
+
+    mark_proc = subprocess.run(
+        mark_cmd,
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True,
+    )
+    if mark_proc.returncode != 0:
+        logger.warning(
+            "Bilibili daily share: failed to mark shared BVIDs {}: {}",
+            bvids,
+            mark_proc.stderr.strip() or mark_proc.stdout.strip(),
+        )
+        return []
+
+    logger.info("Bilibili daily share: marked shared BVIDs {}", bvids)
+    return bvids
+
+
+def _mark_bilibili_login_reminder(workspace_path: Path, *, at_ms: int | None = None) -> int:
+    """Persist the last Bilibili login reminder timestamp."""
+    when_ms = int(at_ms if at_ms is not None else time.time() * 1000)
+    state_path = workspace_path / "services" / "bilibili-daily-share" / "state.json"
+    payload: dict[str, Any]
+    if state_path.exists():
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+
+    payload.setdefault("version", 1)
+    payload.setdefault("shared_video_ids", [])
+    payload.setdefault("aid_aliases", {})
+    payload["last_login_reminder_at_ms"] = when_ms
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return when_ms
+
+
+async def _mirror_weixin_share_if_enabled(job, response: str, *, config_path: Path | None = None) -> dict[str, str]:
+    """Mirror a final share message to Weixin allowFrom targets when enabled."""
+    if not job.payload.mirror_weixin_allowfrom:
+        return {}
+
+    from nanobot.config.loader import get_config_path
+    from nanobot.utils.weixin_broadcast import send_weixin_broadcast_async
+
+    target_config_path = config_path or get_config_path()
+    try:
+        results = await send_weixin_broadcast_async(response, config_path=target_config_path)
+    except Exception as exc:
+        logger.warning("Weixin mirror failed for cron job '{}': {}", job.name, exc)
+        return {}
+
+    sent = [recipient for recipient, status in results.items() if status == "sent"]
+    failed = {recipient: status for recipient, status in results.items() if status != "sent"}
+    if sent:
+        logger.info("Weixin mirror sent for cron job '{}' to {}", job.name, sent)
+    if failed:
+        logger.warning("Weixin mirror partial failures for cron job '{}': {}", job.name, failed)
+    return results
+
+
+async def _handle_curated_daily_share_response(
+    job,
+    response: str,
+    *,
+    bus,
+    workspace_path: Path,
+    config_path: Path | None = None,
+) -> None:
+    """Handle curated share jobs with custom suppress/deliver/mark semantics."""
+    from nanobot.bus.events import OutboundMessage
+
+    response = (response or "").strip()
+    if not response:
+        return
+
+    if _is_mastodon_daily_share_job(job):
+        if response == _MASTODON_DAILY_SHARE_SENTINEL:
+            logger.info("Mastodon daily share: nothing worth sending today")
+            return
+
+        matched_ids = _collect_mastodon_daily_share_ids(response, workspace_path)
+        if not matched_ids:
+            logger.warning("Mastodon daily share: suppressing response without matchable status ID")
+            return
+
+        await bus.publish_outbound(OutboundMessage(
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+            content=response,
+        ))
+        try:
+            await _mirror_weixin_share_if_enabled(job, response, config_path=config_path)
+        except Exception as exc:
+            logger.warning("Mastodon daily share: unexpected Weixin mirror error: {}", exc)
+        _mark_mastodon_daily_share_ids(workspace_path, matched_ids)
+        return
+
+    if _is_bilibili_daily_share_job(job):
+        if response == _MASTODON_DAILY_SHARE_SENTINEL:
+            logger.info("Bilibili daily share: nothing worth sending today")
+            return
+        if response.startswith(_BILIBILI_LOGIN_REQUIRED_PREFIX):
+            reminder_text = response[len(_BILIBILI_LOGIN_REQUIRED_PREFIX):].strip()
+            if not reminder_text:
+                logger.warning("Bilibili daily share: suppressing empty login reminder")
+                return
+            await bus.publish_outbound(OutboundMessage(
+                channel=job.payload.channel or "cli",
+                chat_id=job.payload.to or "direct",
+                content=reminder_text,
+            ))
+            _mark_bilibili_login_reminder(workspace_path)
+            return
+
+        matched_bvids = _collect_bilibili_daily_share_bvids(response, workspace_path)
+        if not matched_bvids:
+            logger.warning("Bilibili daily share: suppressing response without matchable video URL/BVID")
+            return
+
+        await bus.publish_outbound(OutboundMessage(
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+            content=response,
+        ))
+        try:
+            await _mirror_weixin_share_if_enabled(job, response, config_path=config_path)
+        except Exception as exc:
+            logger.warning("Bilibili daily share: unexpected Weixin mirror error: {}", exc)
+        _mark_bilibili_daily_share_bvids(workspace_path, matched_bvids)
+        return
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -549,6 +888,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        memory_config=config.memory,
         timezone=config.agents.defaults.timezone,
     )
 
@@ -569,21 +909,36 @@ def gateway(
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
+
+        async def _silent_progress(_content: str, *, tool_hint: bool = False) -> None:
+            return None
+
         try:
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                on_progress=None if job.payload.send_progress else _silent_progress,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
-        response = resp.content if resp else ""
+        response = (resp.content if resp else "").strip()
 
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+            return response
+
+        if _is_curated_daily_share_job(job):
+            if response and job.payload.deliver and job.payload.to:
+                await _handle_curated_daily_share_response(
+                    job,
+                    response,
+                    bus=bus,
+                    workspace_path=config.workspace_path,
+                )
             return response
 
         if job.payload.deliver and job.payload.to and response:
@@ -754,6 +1109,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        memory_config=config.memory,
         timezone=config.agents.defaults.timezone,
     )
 
@@ -962,7 +1318,7 @@ def channels_status():
     console.print(table)
 
 
-def _get_bridge_dir() -> Path:
+def _get_bridge_dir(force_rebuild: bool = False) -> Path:
     """Get the bridge directory, setting it up if needed."""
     import shutil
     import subprocess
@@ -970,10 +1326,10 @@ def _get_bridge_dir() -> Path:
     # User's bridge location
     from nanobot.config.paths import get_bridge_install_dir
 
-    user_bridge = get_bridge_install_dir()
+    user_bridge = get_bridge_install_dir("bridge")
 
     # Check if already built
-    if (user_bridge / "dist" / "index.js").exists():
+    if not force_rebuild and (user_bridge / "dist" / "index.js").exists():
         return user_bridge
 
     # Check for npm
@@ -1023,9 +1379,38 @@ def _get_bridge_dir() -> Path:
     return user_bridge
 
 
+def _run_node_bridge(
+    *,
+    script: str,
+    bridge_env: dict[str, str],
+    startup_title: str,
+    startup_hint: str | None = None,
+    force_rebuild: bool = False,
+) -> None:
+    """Run a bundled Node.js bridge entrypoint."""
+    import shutil
+    import subprocess
+
+    bridge_dir = _get_bridge_dir(force_rebuild=force_rebuild)
+    node_path = shutil.which("node")
+    if not node_path:
+        console.print("[red]node not found. Please install Node.js.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} {startup_title}")
+    if startup_hint:
+        console.print(f"{startup_hint}\n")
+
+    env = {**os.environ, **bridge_env}
+    try:
+        subprocess.run([node_path, script], cwd=bridge_dir, check=True, env=env)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Bridge failed: {e}[/red]")
+
+
 @channels_app.command("login")
 def channels_login(
-    channel_name: str = typer.Argument(..., help="Channel name (e.g. weixin, whatsapp)"),
+    channel_name: str = typer.Argument(..., help="Channel name (e.g. whatsapp)"),
     force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
 ):
     """Authenticate with a channel via QR code or other interactive login."""
@@ -1033,9 +1418,14 @@ def channels_login(
     from nanobot.config.loader import load_config
 
     config = load_config()
+    from nanobot.config.paths import get_runtime_subdir
+
+    if channel_name == "weixin":
+        console.print("[yellow]Use `nanobot weixin login` for Weixin.[/yellow]")
+        raise typer.Exit(1)
+
     channel_cfg = getattr(config.channels, channel_name, None) or {}
 
-    # Validate channel exists
     all_channels = discover_all()
     if channel_name not in all_channels:
         available = ", ".join(all_channels.keys())
@@ -1044,13 +1434,282 @@ def channels_login(
 
     console.print(f"{__logo__} {all_channels[channel_name].display_name} Login\n")
 
+    if channel_name == "whatsapp":
+        env = {**os.environ}
+        bridge_token = (
+            channel_cfg.get("bridgeToken", "")
+            if isinstance(channel_cfg, dict)
+            else getattr(channel_cfg, "bridge_token", "")
+        )
+        if bridge_token:
+            env["BRIDGE_TOKEN"] = bridge_token
+        env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
+        _run_node_bridge(
+            script="dist/index.js",
+            bridge_env=env,
+            startup_title="Starting bridge...",
+            startup_hint="Scan the QR code to connect.",
+        )
+        return
+
     channel_cls = all_channels[channel_name]
     channel = channel_cls(channel_cfg, bus=None)
+    if not hasattr(channel, "login"):
+        console.print(f"[red]Channel {channel_name} does not support interactive login.[/red]")
+        raise typer.Exit(1)
 
     success = asyncio.run(channel.login(force=force))
-
     if not success:
         raise typer.Exit(1)
+
+
+weixin_app = typer.Typer(help="Manage Weixin channel")
+app.add_typer(weixin_app, name="weixin")
+
+
+def _load_weixin_channel_cfg(config_path: str | None = None) -> tuple[Config, Any]:
+    config = _load_runtime_config(config_path)
+    section = getattr(config.channels, "weixin", None) or {}
+    return config, section
+
+
+def _weixin_state_dir(config_path: str | None = None) -> Path:
+    from nanobot.config.paths import get_runtime_subdir
+
+    _config, section = _load_weixin_channel_cfg(config_path)
+    state_dir = (
+        section.get("stateDir", "")
+        if isinstance(section, dict)
+        else getattr(section, "state_dir", "")
+    )
+    if state_dir:
+        return Path(state_dir).expanduser().resolve()
+    return get_runtime_subdir("weixin-auth")
+
+
+def _resolve_config_path_for_runtime(config_path: str | None = None) -> Path:
+    from nanobot.config.loader import get_config_path
+
+    if config_path:
+        return Path(config_path).expanduser().resolve()
+    return get_config_path().resolve()
+
+
+def _finalize_weixin_login_state(
+    *,
+    config_path: Path,
+    user_id: str,
+    base_url: str,
+    state_dir: Path,
+) -> Path:
+    """Persist Weixin channel config for immediate use after QR login."""
+    import json
+
+    raw = {}
+    if config_path.exists():
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+
+    channels = raw.setdefault("channels", {})
+    section = channels.setdefault("weixin", {})
+    if not isinstance(section, dict):
+        section = {}
+        channels["weixin"] = section
+
+    allow_from = section.get("allowFrom")
+    if not isinstance(allow_from, list):
+        allow_from = []
+
+    normalized_allow = [str(item) for item in allow_from if str(item).strip()]
+    if user_id not in normalized_allow:
+        normalized_allow.append(user_id)
+
+    section["enabled"] = True
+    section["bridgeUrl"] = "ws://127.0.0.1:3002"
+    section["allowFrom"] = normalized_allow
+    section["stateDir"] = str(state_dir)
+    if not section.get("baseUrl"):
+        section["baseUrl"] = base_url
+    if "bridgeToken" not in section:
+        section["bridgeToken"] = ""
+    if "typingEnabled" not in section:
+        section["typingEnabled"] = True
+    if "mediaEnabled" not in section:
+        section["mediaEnabled"] = True
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    return config_path
+
+
+@weixin_app.command("login")
+def weixin_login(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Start the Weixin bridge and add/login an account via QR code."""
+    _config, section = _load_weixin_channel_cfg(config)
+    bridge_token = (
+        section.get("bridgeToken", "")
+        if isinstance(section, dict)
+        else getattr(section, "bridge_token", "")
+    )
+    base_url = (
+        section.get("baseUrl", "")
+        if isinstance(section, dict)
+        else getattr(section, "base_url", "")
+    )
+    env = {
+        "BRIDGE_PORT": "3002",
+        "AUTH_DIR": str(_weixin_state_dir(config)),
+        "WEIXIN_BASE_URL": base_url or "https://ilinkai.weixin.qq.com",
+        "WEIXIN_LOGIN": "1",
+        "WEIXIN_CONFIG_PATH": str(_resolve_config_path_for_runtime(config)),
+        "WEIXIN_GATEWAY_SERVICE": "nanobot-gateway.service",
+        "WEIXIN_NANOBOT_BIN": str(Path(sys.argv[0]).resolve()) if sys.argv and sys.argv[0] else "nanobot",
+        "WEIXIN_QR_PATH": str((Path.home() / "weixin-qr.png").resolve()),
+    }
+    if bridge_token:
+        env["BRIDGE_TOKEN"] = bridge_token
+
+    _run_node_bridge(
+        script="dist/weixin-index.js",
+        bridge_env=env,
+        startup_title="Starting Weixin bridge...",
+        startup_hint="Scan the QR code in this terminal to connect Weixin.",
+        force_rebuild=True,
+    )
+
+
+@weixin_app.command("bridge")
+def weixin_bridge(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Run the Weixin bridge using saved login state."""
+    _config, section = _load_weixin_channel_cfg(config)
+    bridge_token = (
+        section.get("bridgeToken", "")
+        if isinstance(section, dict)
+        else getattr(section, "bridge_token", "")
+    )
+    base_url = (
+        section.get("baseUrl", "")
+        if isinstance(section, dict)
+        else getattr(section, "base_url", "")
+    )
+    env = {
+        "BRIDGE_PORT": "3002",
+        "AUTH_DIR": str(_weixin_state_dir(config)),
+        "WEIXIN_BASE_URL": base_url or "https://ilinkai.weixin.qq.com",
+        "WEIXIN_CONFIG_PATH": str(_resolve_config_path_for_runtime(config)),
+    }
+    if bridge_token:
+        env["BRIDGE_TOKEN"] = bridge_token
+
+    _run_node_bridge(
+        script="dist/weixin-index.js",
+        bridge_env=env,
+        startup_title="Starting Weixin bridge...",
+        force_rebuild=True,
+    )
+
+
+@weixin_app.command("status")
+def weixin_status(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Show saved Weixin accounts."""
+    import json
+
+    state_dir = _weixin_state_dir(config)
+    accounts_dir = state_dir / "accounts"
+    table = Table(title="Weixin Accounts")
+    table.add_column("Account", style="cyan")
+    table.add_column("User", style="magenta")
+    table.add_column("Base URL", style="green")
+    table.add_column("Saved", style="dim")
+
+    rows = 0
+    if accounts_dir.exists():
+        for path in sorted(accounts_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            table.add_row(
+                str(data.get("accountId") or path.stem),
+                str(data.get("userId") or "-"),
+                str(data.get("baseUrl") or "-"),
+                str(data.get("savedAt") or "-"),
+            )
+            rows += 1
+
+    if rows == 0:
+        console.print("[yellow]No saved Weixin accounts found.[/yellow]")
+        return
+    console.print(table)
+
+
+@weixin_app.command("logout")
+def weixin_logout(
+    account: str = typer.Argument(..., help="Saved Weixin account ID to remove"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Remove a saved Weixin account."""
+    state_dir = _weixin_state_dir(config)
+    account_file = state_dir / "accounts" / f"{account}.json"
+    sync_file = state_dir / "sync" / f"{account}.json"
+
+    if not account_file.exists():
+        console.print(f"[red]Account not found: {account}[/red]")
+        raise typer.Exit(1)
+
+    account_file.unlink()
+    if sync_file.exists():
+        sync_file.unlink()
+    console.print(f"[green]✓[/green] Removed Weixin account {account}")
+
+
+@weixin_app.command("finalize-login", hidden=True)
+def weixin_finalize_login(
+    user_id: str = typer.Option(..., "--user-id"),
+    base_url: str = typer.Option(..., "--base-url"),
+    state_dir: str = typer.Option(..., "--state-dir"),
+    gateway_service: str = typer.Option("nanobot-gateway.service", "--gateway-service"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Internal helper: enable Weixin channel and restart gateway."""
+    import subprocess
+
+    config_path = _resolve_config_path_for_runtime(config)
+    updated = _finalize_weixin_login_state(
+        config_path=config_path,
+        user_id=user_id,
+        base_url=base_url,
+        state_dir=Path(state_dir).expanduser().resolve(),
+    )
+    console.print(f"[green]✓[/green] Updated Weixin config at {updated}")
+
+    restart_cmd = ["systemctl", "restart", gateway_service]
+    try:
+        subprocess.run(restart_cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        restart_cmd = ["sudo", "-n", "systemctl", "restart", gateway_service]
+        try:
+            subprocess.run(restart_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            stdout = (e.stdout or "").strip()
+            detail = stderr or stdout or str(e)
+            console.print(f"[red]Failed to restart {gateway_service}: {detail}[/red]")
+            raise typer.Exit(1)
+
+    status = subprocess.run(
+        ["systemctl", "is-active", gateway_service],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    state = (status.stdout or "").strip() or "unknown"
+    console.print(f"[green]✓[/green] Restarted {gateway_service} ({state})")
 
 
 # ============================================================================

@@ -98,6 +98,27 @@ class CronTool(Tool):
                     ),
                 },
                 "job_id": {"type": "string", "description": "Job ID (for remove)"},
+                "send_progress": {
+                    "type": "boolean",
+                    "description": (
+                        "Optional: whether to send progress updates to the user while the job runs. "
+                        "Defaults to true."
+                    ),
+                },
+                "daily_random_start": {
+                    "type": "string",
+                    "description": (
+                        "Optional daily random window start in HH:MM, e.g. '08:00'. "
+                        "Use together with daily_random_end."
+                    ),
+                },
+                "daily_random_end": {
+                    "type": "string",
+                    "description": (
+                        "Optional daily random window end in HH:MM, e.g. '20:00'. "
+                        "Use together with daily_random_start."
+                    ),
+                },
             },
             "required": ["action"],
         }
@@ -110,13 +131,25 @@ class CronTool(Tool):
         cron_expr: str | None = None,
         tz: str | None = None,
         at: str | None = None,
+        send_progress: bool = True,
+        daily_random_start: str | None = None,
+        daily_random_end: str | None = None,
         job_id: str | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(message, every_seconds, cron_expr, tz, at)
+            return self._add_job(
+                message,
+                every_seconds,
+                cron_expr,
+                tz,
+                at,
+                daily_random_start,
+                daily_random_end,
+                send_progress,
+            )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -130,16 +163,21 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        daily_random_start: str | None = None,
+        daily_random_end: str | None = None,
+        send_progress: bool = True,
     ) -> str:
         if not message:
             return "Error: message is required for add"
         if not self._channel or not self._chat_id:
             return "Error: no session context (channel/chat_id)"
-        if tz and not cron_expr:
-            return "Error: tz can only be used with cron_expr"
+        if tz and not (cron_expr or (daily_random_start and daily_random_end)):
+            return "Error: tz can only be used with cron_expr or daily_random windows"
         if tz:
             if err := self._validate_timezone(tz):
                 return err
+        if bool(daily_random_start) != bool(daily_random_end):
+            return "Error: daily_random_start and daily_random_end must be provided together"
 
         # Build schedule
         delete_after = False
@@ -150,6 +188,16 @@ class CronTool(Tool):
             if err := self._validate_timezone(effective_tz):
                 return err
             schedule = CronSchedule(kind="cron", expr=cron_expr, tz=effective_tz)
+        elif daily_random_start and daily_random_end:
+            effective_tz = tz or self._default_timezone
+            if err := self._validate_timezone(effective_tz):
+                return err
+            schedule = CronSchedule(
+                kind="daily_random",
+                tz=effective_tz,
+                window_start=daily_random_start,
+                window_end=daily_random_end,
+            )
         elif at:
             from zoneinfo import ZoneInfo
 
@@ -165,13 +213,14 @@ class CronTool(Tool):
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
-            return "Error: either every_seconds, cron_expr, or at is required"
+            return "Error: either every_seconds, cron_expr, at, or daily_random_start/end is required"
 
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
             message=message,
             deliver=True,
+            send_progress=send_progress,
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
@@ -183,6 +232,9 @@ class CronTool(Tool):
         if schedule.kind == "cron":
             tz = f" ({schedule.tz})" if schedule.tz else ""
             return f"cron: {schedule.expr}{tz}"
+        if schedule.kind == "daily_random" and schedule.window_start and schedule.window_end:
+            tz = f" ({schedule.tz})" if schedule.tz else ""
+            return f"daily random: {schedule.window_start}-{schedule.window_end}{tz}"
         if schedule.kind == "every" and schedule.every_ms:
             ms = schedule.every_ms
             if ms % 3_600_000 == 0:
@@ -219,7 +271,8 @@ class CronTool(Tool):
         lines = []
         for j in jobs:
             timing = self._format_timing(j.schedule)
-            parts = [f"- {j.name} (id: {j.id}, {timing})"]
+            progress = ", silent progress" if not j.payload.send_progress else ""
+            parts = [f"- {j.name} (id: {j.id}, {timing}{progress})"]
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)

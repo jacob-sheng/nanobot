@@ -45,6 +45,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     """Build an outbound status message for a session."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    effective_model = loop.get_effective_model(ctx.key)
     ctx_est = 0
     try:
         ctx_est, _ = loop.memory_consolidator.estimate_session_prompt_tokens(session)
@@ -56,7 +57,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=build_status_content(
-            version=__version__, model=loop.model,
+            version=__version__, model=effective_model, default_model=loop.default_model,
             start_time=loop._start_time, last_usage=loop._last_usage,
             context_window_tokens=loop.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
@@ -72,6 +73,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
     session.clear()
+    loop.clear_session_model_override(ctx.key)
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
@@ -87,6 +89,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     lines = [
         "🐈 nanobot commands:",
         "/new — Start a new conversation",
+        "/switch — Show or change the model for this chat",
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
@@ -100,11 +103,49 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_switch(ctx: CommandContext) -> OutboundMessage:
+    """Show or change the active model for the current chat session."""
+    loop = ctx.loop
+    raw_args = (ctx.args or "").strip()
+    current_model = loop.get_effective_model(ctx.key)
+    default_model = loop.default_model
+
+    if not raw_args:
+        content = "\n".join([
+            f"Current model: {current_model}",
+            f"Default model: {default_model}",
+            "Usage: /switch <model-id>",
+            "Use /switch default to reset this chat.",
+        ])
+    elif raw_args.lower() == "default":
+        loop.clear_session_model_override(ctx.key)
+        content = "\n".join([
+            f"Using default model for this chat: {default_model}",
+            "Use /switch <model-id> to override it for this chat.",
+        ])
+    else:
+        loop.set_session_model_override(ctx.key, raw_args)
+        content = "\n".join([
+            f"Switched this chat to model: {raw_args}",
+            f"Default model remains: {default_model}",
+            "Use /switch default to reset this chat.",
+        ])
+
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={"render_as": "text"},
+    )
+
+
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
+    router.exact("/switch", cmd_switch)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)
+    router.prefix("/switch ", cmd_switch)

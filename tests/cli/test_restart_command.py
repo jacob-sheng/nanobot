@@ -116,8 +116,103 @@ class TestRestartCommand:
 
         assert response is not None
         assert "/restart" in response.content
+        assert "/switch" in response.content
         assert "/status" in response.content
         assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_switch_bare_reports_current_and_default_model(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        response = await loop._process_message(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/switch")
+        )
+
+        assert response is not None
+        assert "Current model: test-model" in response.content
+        assert "Default model: test-model" in response.content
+        assert "Usage: /switch <model-id>" in response.content
+        assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_switch_sets_session_override(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        response = await loop._process_message(
+            InboundMessage(
+                channel="telegram",
+                sender_id="u1",
+                chat_id="c1",
+                content="/switch openai/foo",
+            )
+        )
+
+        assert response is not None
+        assert loop.get_effective_model("telegram:c1") == "openai/foo"
+        assert "openai/foo" in response.content
+        assert "Default model remains: test-model" in response.content
+        assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_switch_default_clears_override(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+        loop.set_session_model_override("telegram:c1", "openai/foo")
+
+        response = await loop._process_message(
+            InboundMessage(
+                channel="telegram",
+                sender_id="u1",
+                chat_id="c1",
+                content="/switch default",
+            )
+        )
+
+        assert response is not None
+        assert loop.get_effective_model("telegram:c1") == "test-model"
+        assert "Using default model for this chat: test-model" in response.content
+        assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_new_clears_model_override(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+        loop.set_session_model_override("telegram:c1", "openai/foo")
+
+        response = await loop._process_message(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/new")
+        )
+
+        assert response is not None
+        assert loop.get_effective_model("telegram:c1") == "test-model"
+        assert "New session started." in response.content
+
+    @pytest.mark.asyncio
+    async def test_process_message_uses_effective_model(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = []
+        loop.sessions.get_or_create.return_value = session
+        loop.memory_consolidator.maybe_consolidate_by_tokens = AsyncMock()
+        loop.semantic_memory.enabled = False
+        loop._run_agent_loop = AsyncMock(return_value=("ok", [], []))
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.set_session_model_override("telegram:c1", "openai/foo")
+
+        response = await loop._process_message(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="hello")
+        )
+
+        assert response is not None
+        assert response.content == "ok"
+        assert loop._run_agent_loop.await_args.kwargs["model"] == "openai/foo"
 
     @pytest.mark.asyncio
     async def test_status_reports_runtime_info(self):
@@ -142,6 +237,25 @@ class TestRestartCommand:
         assert "Session: 3 messages" in response.content
         assert "Uptime: 2m 5s" in response.content
         assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_status_reports_override_model(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = []
+        loop.sessions.get_or_create.return_value = session
+        loop._last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        loop.memory_consolidator.estimate_session_prompt_tokens = MagicMock(
+            return_value=(0, "none")
+        )
+        loop.set_session_model_override("telegram:c1", "openai/foo")
+
+        response = await loop._process_message(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
+        )
+
+        assert response is not None
+        assert "Model: openai/foo (default: test-model)" in response.content
 
     @pytest.mark.asyncio
     async def test_run_agent_loop_resets_usage_when_provider_omits_it(self):

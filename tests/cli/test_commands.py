@@ -7,7 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _make_provider, app
+from nanobot.cli.commands import _finalize_weixin_login_state, _make_provider, app
 from nanobot.config.schema import Config
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
@@ -199,6 +199,39 @@ def test_onboard_wizard_preserves_explicit_config_in_next_steps(tmp_path, monkey
     assert f"nanobot gateway --config {resolved_config}" in compact_output
 
 
+def test_finalize_weixin_login_state_updates_config(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "telegram_planbridge": {
+                        "enabled": True,
+                        "allowFrom": ["6682937110"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state_dir = tmp_path / "weixin-auth"
+    updated = _finalize_weixin_login_state(
+        config_path=config_path,
+        user_id="wx_user@im.wechat",
+        base_url="https://ilinkai.weixin.qq.com",
+        state_dir=state_dir,
+    )
+
+    assert updated == config_path
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert raw["channels"]["telegram_planbridge"]["enabled"] is True
+    assert raw["channels"]["weixin"]["enabled"] is True
+    assert raw["channels"]["weixin"]["bridgeUrl"] == "ws://127.0.0.1:3002"
+    assert raw["channels"]["weixin"]["allowFrom"] == ["wx_user@im.wechat"]
+    assert raw["channels"]["weixin"]["stateDir"] == str(state_dir)
+
+
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():
     config = Config()
     config.agents.defaults.model = "github-copilot/gpt-5.3-codex"
@@ -307,9 +340,79 @@ def test_config_falls_back_to_vllm_when_ollama_not_configured():
     assert config.get_provider_name() == "vllm"
     assert config.get_api_base() == "http://localhost:8000"
 
+def test_config_parses_semantic_memory_settings_from_camel_case():
+    config = Config.model_validate(
+        {
+            "memory": {
+                "markdown": {
+                    "enabled": False,
+                    "loadLongTermIntoContext": False,
+                    "persistLongTerm": False,
+                    "persistHistory": False,
+                    "auditSemanticWrites": False,
+                    "readHistoryOnDemandOnly": True,
+                },
+                "semantic": {
+                    "enabled": True,
+                    "syncHistoryEntries": False,
+                    "scope": "global",
+                    "userId": "global",
+                    "topK": 8,
+                    "maxContextChars": 2000,
+                    "searchThreshold": 0.3,
+                    "nim": {
+                        "model": "nvidia/llama-nemotron-embed-vl-1b-v2",
+                        "baseUrl": "https://integrate.api.nvidia.com/v1",
+                        "credentialsFile": "~/NIM.key",
+                    },
+                    "mem0": {
+                        "collectionName": "nanobot_global",
+                        "qdrantPath": "~/.nanobot/state/mem0/qdrant",
+                        "embeddingDims": 2048,
+                        "onDisk": True,
+                    },
+                    "autoCapture": {
+                        "enabled": True,
+                        "scope": "broad_life",
+                        "notifyMode": "inline_hint",
+                        "minConfidence": 0.8,
+                        "dedupeThreshold": 0.9,
+                        "maxInputChars": 1200,
+                        "contextMessages": 4,
+                    },
+                }
+            }
+        }
+    )
+
+    assert config.memory.markdown.enabled is False
+    assert config.memory.markdown.persist_long_term is False
+    assert config.memory.semantic.enabled is True
+    assert config.memory.semantic.sync_history_entries is False
+    assert config.memory.semantic.user_id == "global"
+    assert config.memory.semantic.nim.model == "nvidia/llama-nemotron-embed-vl-1b-v2"
+    assert config.memory.semantic.mem0.embedding_dims == 2048
+    assert config.memory.semantic.auto_capture.enabled is True
+    assert config.memory.semantic.auto_capture.notify_mode == "inline_hint"
+
+
+def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"provider": "auto", "model": "github-copilot/gpt-5.3-codex"}},
+            "providers": {"github_copilot": {}},
+        }
+    )
+
+    assert config.get_provider_name() == "github_copilot"
+
 
 def test_openai_compat_provider_passes_model_through():
     from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
+    spec = find_by_name("github_copilot")
+    assert spec is not None
+    assert spec.name == "github_copilot"
 
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         provider = OpenAICompatProvider(default_model="github-copilot/gpt-5.3-codex")

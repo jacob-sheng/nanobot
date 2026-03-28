@@ -8,6 +8,7 @@ import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -17,12 +18,14 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.semantic_memory import SemanticMemory
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.semantic_memory import MemoryAddTool, MemorySearchTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -33,7 +36,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, MemoryConfig, WebSearchConfig
     from nanobot.cron.service import CronService
 
 
@@ -50,6 +53,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _WEIXIN_RUNTIME_TIME_IDLE_SECONDS = 10 * 60
 
     def __init__(
         self,
@@ -67,6 +71,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        memory_config: MemoryConfig | None = None,
         timezone: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
@@ -76,6 +81,7 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.default_model = self.model
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
         self.web_search_config = web_search_config or WebSearchConfig()
@@ -86,7 +92,8 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
 
-        self.context = ContextBuilder(workspace, timezone=timezone)
+        self.context = ContextBuilder(workspace, memory_config=memory_config, timezone=timezone)
+        self.semantic_memory = SemanticMemory(memory_config, workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
@@ -109,6 +116,7 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_model_overrides: dict[str, str] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -122,6 +130,12 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            markdown_config=memory_config.markdown if memory_config else None,
+            on_history_entry=(
+                self.semantic_memory.add_history_entry
+                if self.semantic_memory.enabled and self.semantic_memory.config and self.semantic_memory.config.sync_history_entries
+                else None
+            ),
             max_completion_tokens=provider.generation.max_tokens,
         )
         self._register_default_tools()
@@ -150,6 +164,9 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        if self.semantic_memory.enabled:
+            self.tools.register(MemoryAddTool(self.semantic_memory))
+            self.tools.register(MemorySearchTool(self.semantic_memory))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -173,12 +190,54 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id)
+                    elif name == "spawn":
+                        key = session_key or f"{channel}:{chat_id}"
+                        tool.set_context(channel, chat_id, key, self.get_effective_model(key))
+                    else:
+                        tool.set_context(channel, chat_id)
+
+    def get_effective_model(self, session_key: str) -> str:
+        """Return the active model for one session."""
+        return self._session_model_overrides.get(session_key, self.default_model)
+
+    def set_session_model_override(self, session_key: str, model: str) -> None:
+        """Override the model for one session."""
+        self._session_model_overrides[session_key] = model
+
+    def clear_session_model_override(self, session_key: str) -> None:
+        """Remove the model override for one session."""
+        self._session_model_overrides.pop(session_key, None)
+
+    def _should_include_runtime_time(self, channel: str, session: Session) -> bool:
+        """Return whether the current turn should include runtime time context."""
+        if channel != "weixin":
+            return True
+        if not session.messages:
+            return False
+
+        last_timestamp = session.messages[-1].get("timestamp")
+        if not isinstance(last_timestamp, str) or not last_timestamp:
+            return False
+
+        try:
+            last_dt = datetime.fromisoformat(last_timestamp)
+        except ValueError:
+            return False
+
+        return (datetime.now() - last_dt).total_seconds() >= self._WEIXIN_RUNTIME_TIME_IDLE_SECONDS
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -199,6 +258,40 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _extract_guard_reason(messages: list[dict]) -> str | None:
+        """Extract the latest safety-guard block reason from tool results."""
+        marker = "Error: Command blocked by safety guard"
+        reason_re = re.compile(r"Error: Command blocked by safety guard \(([^)]+)\)")
+        for msg in reversed(messages):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or marker not in content:
+                continue
+            matched = reason_re.search(content)
+            if matched:
+                return matched.group(1).strip()
+            return content.strip().splitlines()[0]
+        return None
+
+    @staticmethod
+    def _extract_latest_tool_result(messages: list[dict], max_chars: int = 4000) -> str | None:
+        """Extract latest non-empty tool result for fallback messaging."""
+        for msg in reversed(messages):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            text = content.strip()
+            if not text:
+                continue
+            if len(text) > max_chars:
+                return text[:max_chars] + "\n... (truncated)"
+            return text
+        return None
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -209,6 +302,8 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        model: str | None = None,
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -218,6 +313,8 @@ class AgentLoop:
         ``resuming=False`` means this is the final response.
         """
         loop_self = self
+        active_model = model or self.model
+        active_session_key = session_key or f"{channel}:{chat_id}"
 
         class _LoopHook(AgentHook):
             def __init__(self) -> None:
@@ -252,7 +349,7 @@ class AgentLoop:
                 for tc in context.tool_calls:
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
-                loop_self._set_tool_context(channel, chat_id, message_id)
+                loop_self._set_tool_context(channel, chat_id, message_id, active_session_key)
 
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
@@ -260,7 +357,7 @@ class AgentLoop:
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
-            model=self.model,
+            model=active_model,
             max_iterations=self.max_iterations,
             hook=_LoopHook(),
             error_message="Sorry, I encountered an error calling the AI model.",
@@ -348,6 +445,9 @@ class AgentLoop:
                 )
                 if response is not None:
                     await self.bus.publish_outbound(response)
+                    auto_capture_request = getattr(response, "_auto_capture_request", None)
+                    if auto_capture_request:
+                        self._schedule_background(self._run_auto_capture(auto_capture_request))
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -368,6 +468,7 @@ class AgentLoop:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
+        self.semantic_memory.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -386,6 +487,50 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def _should_auto_capture(self, msg: InboundMessage, session_key: str) -> bool:
+        """Return True when this turn should be considered for automatic semantic memory."""
+        if not self.semantic_memory.auto_capture_enabled:
+            return False
+        if not msg.content.strip() or msg.content.lstrip().startswith("/"):
+            return False
+        if msg.channel == "system":
+            return False
+
+        lowered = session_key.lower()
+        if lowered.startswith("cron:"):
+            return False
+        if any(marker in lowered for marker in ("daily-digest", "heartbeat", "planbridge")):
+            return False
+
+        return self.semantic_memory.should_auto_capture_turn(msg.content)
+
+    async def _run_auto_capture(self, payload: dict[str, Any]) -> None:
+        """Extract and store durable user memories after the main reply is already sent."""
+        try:
+            result = await self.semantic_memory.auto_capture_turn(
+                provider=self.provider,
+                model=self.model,
+                user_message=payload["user_message"],
+                recent_messages=payload.get("recent_messages") or [],
+            )
+        except Exception:
+            logger.exception("Automatic semantic capture failed")
+            return
+
+        if not result.stored or not self.semantic_memory.config:
+            return
+
+        if self.semantic_memory.config.auto_capture.notify_mode == "inline_hint":
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=payload["channel"],
+                    chat_id=payload["chat_id"],
+                    content="（我记下了）",
+                    reply_to=payload.get("reply_to"),
+                    metadata={"_memory_hint": True},
+                )
+            )
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -401,19 +546,23 @@ class AgentLoop:
                                 else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
+            effective_model = self.get_effective_model(key)
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), key)
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
+                include_runtime_time=self._should_include_runtime_time(channel, session),
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                model=effective_model,
+                session_key=key,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
@@ -425,6 +574,7 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
+        effective_model = self.get_effective_model(key)
         session = self.sessions.get_or_create(key)
 
         # Slash commands
@@ -435,17 +585,25 @@ class AgentLoop:
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), key)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        auto_capture_request: dict[str, Any] | None = None
+        extra_sections: list[str] | None = None
+        if self.semantic_memory.enabled and not raw.startswith("/"):
+            recall = await self.semantic_memory.search_context(msg.content)
+            if recall:
+                extra_sections = [recall]
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
+            extra_sections=extra_sections,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            include_runtime_time=self._should_include_runtime_time(msg.channel, session),
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -456,35 +614,69 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            model=effective_model,
+            session_key=key,
         )
 
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            guard_reason = self._extract_guard_reason(all_msgs)
+            if guard_reason:
+                final_content = (
+                    "I couldn't complete this because a safety guard blocked a command "
+                    f"({guard_reason})."
+                )
+            else:
+                latest_tool_result = self._extract_latest_tool_result(all_msgs)
+                if latest_tool_result:
+                    final_content = (
+                        "I completed tool execution, but the model returned an empty reply.\n"
+                        "Latest tool result:\n"
+                        f"{latest_tool_result}"
+                    )
+                else:
+                    final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+
+        explicit_memory_write = "memory_add" in tools_used
+        if not explicit_memory_write and self._should_auto_capture(msg, session_key or msg.session_key):
+            context_limit = (
+                self.semantic_memory.config.auto_capture.context_messages * 2
+                if self.semantic_memory.config
+                else 8
+            )
+            auto_capture_request = {
+                "channel": msg.channel,
+                "chat_id": msg.chat_id,
+                "reply_to": msg.metadata.get("message_id"),
+                "user_message": msg.content,
+                "recent_messages": history[-context_limit:],
+            }
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
         meta = dict(msg.metadata or {})
         if on_stream is not None:
             meta["_streamed"] = True
-        return OutboundMessage(
+        response = OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=meta,
         )
+        if auto_capture_request:
+            setattr(response, "_auto_capture_request", auto_capture_request)
+        return response
 
     @staticmethod
     def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
@@ -578,7 +770,12 @@ class AgentLoop:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        return await self._process_message(
+        response = await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
             on_stream=on_stream, on_stream_end=on_stream_end,
         )
+        if response is not None:
+            auto_capture_request = getattr(response, "_auto_capture_request", None)
+            if auto_capture_request:
+                self._schedule_background(self._run_auto_capture(auto_capture_request))
+        return response

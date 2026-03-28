@@ -7,10 +7,11 @@ import json
 import weakref
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.config.schema import MarkdownMemoryConfig
 from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
@@ -77,25 +78,37 @@ class MemoryStore:
 
     _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, markdown_config: MarkdownMemoryConfig | None = None):
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
+        self.markdown_config = markdown_config or MarkdownMemoryConfig()
         self._consecutive_failures = 0
 
     def read_long_term(self) -> str:
+        if not self.markdown_config.enabled:
+            return ""
         if self.memory_file.exists():
             return self.memory_file.read_text(encoding="utf-8")
         return ""
 
     def write_long_term(self, content: str) -> None:
+        if not (self.markdown_config.enabled and self.markdown_config.persist_long_term):
+            return
         self.memory_file.write_text(content, encoding="utf-8")
 
     def append_history(self, entry: str) -> None:
+        if not (self.markdown_config.enabled and self.markdown_config.persist_history):
+            return
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
+        if not (
+            self.markdown_config.enabled
+            and self.markdown_config.load_long_term_into_context
+        ):
+            return ""
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
@@ -116,12 +129,13 @@ class MemoryStore:
         messages: list[dict],
         provider: LLMProvider,
         model: str,
+        on_history_entry: Callable[[str], Awaitable[None]] | None = None,
     ) -> bool:
         """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
         if not messages:
             return True
 
-        current_memory = self.read_long_term()
+        current_memory = self.read_long_term() if self.markdown_config.persist_long_term else ""
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
 ## Current Long-term Memory
@@ -163,32 +177,37 @@ class MemoryStore:
                     len(response.content or ""),
                     (response.content or "")[:200],
                 )
-                return self._fail_or_raw_archive(messages)
+                return await self._fail_or_raw_archive(messages, on_history_entry=on_history_entry)
 
             args = _normalize_save_memory_args(response.tool_calls[0].arguments)
             if args is None:
                 logger.warning("Memory consolidation: unexpected save_memory arguments")
-                return self._fail_or_raw_archive(messages)
+                return await self._fail_or_raw_archive(messages, on_history_entry=on_history_entry)
 
             if "history_entry" not in args or "memory_update" not in args:
                 logger.warning("Memory consolidation: save_memory payload missing required fields")
-                return self._fail_or_raw_archive(messages)
+                return await self._fail_or_raw_archive(messages, on_history_entry=on_history_entry)
 
             entry = args["history_entry"]
             update = args["memory_update"]
 
             if entry is None or update is None:
                 logger.warning("Memory consolidation: save_memory payload contains null required fields")
-                return self._fail_or_raw_archive(messages)
+                return await self._fail_or_raw_archive(messages, on_history_entry=on_history_entry)
 
             entry = _ensure_text(entry).strip()
             if not entry:
                 logger.warning("Memory consolidation: history_entry is empty after normalization")
-                return self._fail_or_raw_archive(messages)
+                return await self._fail_or_raw_archive(messages, on_history_entry=on_history_entry)
 
             self.append_history(entry)
+            if on_history_entry:
+                try:
+                    await on_history_entry(entry)
+                except Exception:
+                    logger.exception("Semantic history sync failed after consolidation")
             update = _ensure_text(update)
-            if update != current_memory:
+            if self.markdown_config.persist_long_term and update != current_memory:
                 self.write_long_term(update)
 
             self._consecutive_failures = 0
@@ -196,27 +215,35 @@ class MemoryStore:
             return True
         except Exception:
             logger.exception("Memory consolidation failed")
-            return self._fail_or_raw_archive(messages)
+            return await self._fail_or_raw_archive(messages, on_history_entry=on_history_entry)
 
-    def _fail_or_raw_archive(self, messages: list[dict]) -> bool:
+    async def _fail_or_raw_archive(
+        self,
+        messages: list[dict],
+        on_history_entry: Callable[[str], Awaitable[None]] | None = None,
+    ) -> bool:
         """Increment failure count; after threshold, raw-archive messages and return True."""
         self._consecutive_failures += 1
         if self._consecutive_failures < self._MAX_FAILURES_BEFORE_RAW_ARCHIVE:
             return False
-        self._raw_archive(messages)
+        entry = self._build_raw_archive_entry(messages)
+        self.append_history(entry)
+        if on_history_entry:
+            try:
+                await on_history_entry(entry)
+            except Exception:
+                logger.exception("Semantic raw-archive sync failed")
         self._consecutive_failures = 0
         return True
 
-    def _raw_archive(self, messages: list[dict]) -> None:
-        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
+    def _build_raw_archive_entry(self, messages: list[dict]) -> str:
+        """Build a raw-archive entry without requiring Markdown persistence."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
-        )
+        entry = f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
         )
+        return entry
 
 
 class MemoryConsolidator:
@@ -236,8 +263,10 @@ class MemoryConsolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        markdown_config: MarkdownMemoryConfig | None = None,
+        on_history_entry: Callable[[str], Awaitable[None]] | None = None,
     ):
-        self.store = MemoryStore(workspace)
+        self.store = MemoryStore(workspace, markdown_config=markdown_config)
         self.provider = provider
         self.model = model
         self.sessions = sessions
@@ -245,6 +274,7 @@ class MemoryConsolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        self._on_history_entry = on_history_entry
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
@@ -253,7 +283,12 @@ class MemoryConsolidator:
 
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
+        return await self.store.consolidate(
+            messages,
+            self.provider,
+            self.model,
+            on_history_entry=self._on_history_entry,
+        )
 
     def pick_consolidation_boundary(
         self,

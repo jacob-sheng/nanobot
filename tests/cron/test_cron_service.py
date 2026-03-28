@@ -1,8 +1,11 @@
 import asyncio
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from nanobot.cron import service as cron_service_module
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronSchedule
 
@@ -31,6 +34,117 @@ def test_add_job_accepts_valid_timezone(tmp_path) -> None:
 
     assert job.schedule.tz == "America/Vancouver"
     assert job.state.next_run_at_ms is not None
+
+
+def test_add_job_persists_send_progress_flag(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    job = service.add_job(
+        name="quiet share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        send_progress=False,
+    )
+
+    assert job.payload.send_progress is False
+    raw = json.loads(store_path.read_text())
+    assert raw["jobs"][0]["payload"]["sendProgress"] is False
+
+    fresh = CronService(store_path)
+    loaded = fresh.get_job(job.id)
+    assert loaded is not None
+    assert loaded.payload.send_progress is False
+
+
+def test_add_job_accepts_daily_random_schedule(tmp_path, monkeypatch) -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    now = datetime(2026, 3, 26, 7, 30, tzinfo=tz)
+    monkeypatch.setattr(cron_service_module, "_now_ms", lambda: int(now.timestamp() * 1000))
+    monkeypatch.setattr(cron_service_module, "_pick_random_minute", lambda _: 0)
+
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    job = service.add_job(
+        name="rand ok",
+        schedule=CronSchedule(
+            kind="daily_random",
+            window_start="08:00",
+            window_end="20:00",
+            tz="Asia/Shanghai",
+        ),
+        message="hello",
+    )
+
+    next_dt = datetime.fromtimestamp(job.state.next_run_at_ms / 1000, tz=tz)
+    assert next_dt.hour == 8
+    assert next_dt.minute == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_random_start_preserves_existing_next_run(tmp_path, monkeypatch) -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    initial_now = datetime(2026, 3, 26, 7, 30, tzinfo=tz)
+    monkeypatch.setattr(cron_service_module, "_now_ms", lambda: int(initial_now.timestamp() * 1000))
+    monkeypatch.setattr(cron_service_module, "_pick_random_minute", lambda _: 0)
+
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    job = service.add_job(
+        name="rand",
+        schedule=CronSchedule(
+            kind="daily_random",
+            window_start="08:00",
+            window_end="20:00",
+            tz="Asia/Shanghai",
+        ),
+        message="hello",
+    )
+    first_next = job.state.next_run_at_ms
+
+    monkeypatch.setattr(cron_service_module, "_pick_random_minute", lambda max_offset: max_offset)
+    fresh = CronService(tmp_path / "cron" / "jobs.json", on_job=lambda _: asyncio.sleep(0))
+    await fresh.start()
+    try:
+        loaded = fresh.get_job(job.id)
+        assert loaded is not None
+        assert loaded.state.next_run_at_ms == first_next
+        next_dt = datetime.fromtimestamp(loaded.state.next_run_at_ms / 1000, tz=tz)
+        assert next_dt.hour == 8
+        assert next_dt.minute == 0
+    finally:
+        fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_daily_random_reschedules_for_next_day_after_run(tmp_path, monkeypatch) -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    times = iter([
+        int(datetime(2026, 3, 26, 7, 0, tzinfo=tz).timestamp() * 1000),
+        int(datetime(2026, 3, 26, 10, 0, tzinfo=tz).timestamp() * 1000),
+        int(datetime(2026, 3, 26, 10, 0, tzinfo=tz).timestamp() * 1000),
+        int(datetime(2026, 3, 26, 10, 0, tzinfo=tz).timestamp() * 1000),
+    ])
+    monkeypatch.setattr(cron_service_module, "_now_ms", lambda: next(times))
+    monkeypatch.setattr(cron_service_module, "_pick_random_minute", lambda _: 0)
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=lambda _: asyncio.sleep(0))
+    job = service.add_job(
+        name="rand",
+        schedule=CronSchedule(
+            kind="daily_random",
+            window_start="08:00",
+            window_end="20:00",
+            tz="Asia/Shanghai",
+        ),
+        message="hello",
+    )
+
+    await service.run_job(job.id)
+
+    loaded = service.get_job(job.id)
+    next_dt = datetime.fromtimestamp(loaded.state.next_run_at_ms / 1000, tz=tz)
+    assert next_dt.date().isoformat() == "2026-03-27"
+    assert next_dt.hour == 8
+    assert next_dt.minute == 0
 
 
 @pytest.mark.asyncio

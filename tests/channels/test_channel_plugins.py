@@ -265,6 +265,19 @@ def test_builtin_channel_init_from_dict():
     assert ch.config.allow_from == ["*"]
 
 
+def test_weixin_channel_default_config_and_init():
+    """Weixin channel exposes defaults and accepts raw dict config."""
+    from nanobot.channels.weixin import WeixinChannel
+
+    cfg = WeixinChannel.default_config()
+    assert cfg["enabled"] is False
+    assert cfg["bridgeUrl"] == "ws://127.0.0.1:3002"
+
+    ch = WeixinChannel({"enabled": False, "allowFrom": ["*"]}, MessageBus())
+    assert ch.config.bridge_url == "ws://127.0.0.1:3002"
+    assert ch.config.allow_from == ["*"]
+
+
 def test_channels_config_send_max_retries_default():
     """ChannelsConfig should have send_max_retries with default value of 3."""
     cfg = ChannelsConfig()
@@ -877,4 +890,3 @@ async def test_start_all_creates_dispatch_task():
 
     # Dispatch task should have been created
     assert mgr._dispatch_task is not None
-

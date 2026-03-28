@@ -104,6 +104,68 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class SemanticNimConfig(Base):
+    """NVIDIA NIM configuration for semantic embeddings."""
+
+    model: str = "nvidia/llama-nemotron-embed-vl-1b-v2"
+    base_url: str = "https://integrate.api.nvidia.com/v1"
+    credentials_file: str = "~/NIM.key"
+
+
+class SemanticMem0Config(Base):
+    """Mem0 vector store configuration for semantic memory."""
+
+    collection_name: str = "nanobot_global"
+    qdrant_path: str = "~/.nanobot/state/mem0/qdrant"
+    embedding_dims: int = 2048
+    on_disk: bool = True
+
+
+class SemanticAutoCaptureConfig(Base):
+    """Automatic long-term memory extraction from conversation turns."""
+
+    enabled: bool = False
+    scope: Literal["broad_life"] = "broad_life"
+    notify_mode: Literal["off", "inline_hint"] = "off"
+    min_confidence: float = 0.78
+    dedupe_threshold: float = 0.9
+    max_input_chars: int = 1200
+    context_messages: int = 4
+
+
+class SemanticMemoryConfig(Base):
+    """Semantic long-term memory configuration."""
+
+    enabled: bool = False
+    sync_history_entries: bool = True
+    scope: Literal["global"] = "global"
+    user_id: str = "global"
+    top_k: int = 8
+    max_context_chars: int = 2000
+    search_threshold: float = 0.3
+    nim: SemanticNimConfig = Field(default_factory=SemanticNimConfig)
+    mem0: SemanticMem0Config = Field(default_factory=SemanticMem0Config)
+    auto_capture: SemanticAutoCaptureConfig = Field(default_factory=SemanticAutoCaptureConfig)
+
+
+class MarkdownMemoryConfig(Base):
+    """Legacy Markdown memory configuration."""
+
+    enabled: bool = True
+    load_long_term_into_context: bool = True
+    persist_long_term: bool = True
+    persist_history: bool = True
+    audit_semantic_writes: bool = True
+    read_history_on_demand_only: bool = True
+
+
+class MemoryConfig(Base):
+    """Memory subsystem configuration."""
+
+    markdown: MarkdownMemoryConfig = Field(default_factory=MarkdownMemoryConfig)
+    semantic: SemanticMemoryConfig = Field(default_factory=SemanticMemoryConfig)
+
+
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
@@ -157,6 +219,7 @@ class Config(BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     @property
