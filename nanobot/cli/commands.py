@@ -541,81 +541,95 @@ def _extract_bilibili_bvids(text: str) -> list[str]:
     return bvids
 
 
-def _mark_mastodon_daily_share_links(response: str, workspace_path: Path) -> list[str]:
-    """Mark shared Mastodon posts based on URLs present in the final response.
-
-    Matching strategy (in order):
-    1. Direct match: response URL == candidate status URL
-    2. Reverse match: response URL appears inside candidate text / card fields
-       (handles the common case where the LLM shares the external article URL
-       instead of the Mastodon status URL)
-
-    Candidates are read from the prepare cache file written by the most recent
-    ``prepare`` run, avoiding a fresh timeline fetch that might no longer
-    contain the shared posts.
-    """
-    import json
-    import re
-    import subprocess
-
+def _load_mastodon_prepare_cache(workspace_path: Path) -> dict[str, Any]:
+    """Load the most recent Mastodon prepare cache written for callback matching."""
     cache_path = workspace_path / "services" / "mastodon-daily-share" / "last_prepare.json"
-    script = workspace_path / "skills" / "mastodon-daily-share" / "scripts" / "mastodon_daily_share.py"
-    response_urls = set(_extract_urls(response))
-    if not response_urls:
-        return []
-
-    # --- load candidates from cache ---
     if not cache_path.exists():
-        logger.warning("Mastodon daily share: no prepare cache found at {}", cache_path)
-        return []
+        return {}
     try:
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        return json.loads(cache_path.read_text(encoding="utf-8"))
     except Exception:
-        logger.warning("Mastodon daily share: failed to parse prepare cache {}", cache_path)
+        logger.warning("Mastodon daily share: failed to parse {}", cache_path)
+        return {}
+
+
+def _extract_mastodon_status_ids(text: str) -> list[str]:
+    """Extract Mastodon status IDs from URLs in text.
+
+    Matches patterns like ``https://<domain>/@<user>/<numeric_id>``
+    which is the canonical Mastodon status URL format.
+    """
+    import re
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"https?://[^\s/]+/@[^\s/]+/(\d{15,25})", text or ""):
+        if match not in seen:
+            seen.add(match)
+            ids.append(match)
+    return ids
+
+
+def _collect_mastodon_daily_share_ids(response: str, workspace_path: Path) -> list[str]:
+    """Collect status IDs referenced by the final response.
+
+    Matching strategies (any hit is sufficient):
+    1. Mastodon URL regex — extract status IDs from ``/@user/<id>`` URLs
+    2. Reverse URL match — response URLs ∩ URLs embedded in candidate text/card
+    """
+    import re
+
+    payload = _load_mastodon_prepare_cache(workspace_path)
+    response_urls = set(_extract_urls(response))
+    status_ids_in_response = set(_extract_mastodon_status_ids(response))
+    if not response_urls and not status_ids_in_response:
         return []
 
-    candidates = payload.get("candidates", [])
-    if not candidates:
-        logger.warning("Mastodon daily share: prepare cache has no candidates")
-        return []
-
-    # --- build reverse index: any URL mentioned in a candidate -> status_id ---
     def _urls_in_text(text: str) -> set[str]:
         return {m.rstrip(')]}>,. !?\"\',') for m in re.findall(r"https?://\S+", text or "")}
 
-    status_ids: list[str] = []
-    seen_status_ids: set[str] = set()
-    for item in candidates:
-        status_url = str(item.get("url") or "").strip()
+    matched: list[str] = []
+    seen: set[str] = set()
+    for item in payload.get("candidates", []):
         status_id = str(item.get("status_id") or "").strip()
-        if not status_id:
-            continue
-        if status_id in seen_status_ids:
+        status_url = str(item.get("url") or "").strip()
+        if not status_id or status_id in seen:
             continue
 
-        # Collect all URLs that represent this candidate
+        # Strategy 1: Mastodon URL regex — status ID extracted from response URLs
+        if status_id in status_ids_in_response:
+            seen.add(status_id)
+            matched.append(status_id)
+            continue
+
+        # Strategy 2: reverse URL match — response URLs ∩ candidate embedded URLs
         candidate_urls: set[str] = set()
         if status_url:
             candidate_urls.add(status_url)
-        # URLs inside post text (external article links, etc.)
         candidate_urls.update(_urls_in_text(str(item.get("text") or "")))
-        # URLs from card data
         card_url = str(item.get("card_url") or "").strip()
         if card_url:
             candidate_urls.add(card_url)
-
-        # Match if any response URL overlaps with candidate URLs
         if response_urls & candidate_urls:
-            seen_status_ids.add(status_id)
-            status_ids.append(status_id)
+            seen.add(status_id)
+            matched.append(status_id)
 
+    return matched
+
+
+def _mark_mastodon_daily_share_ids(workspace_path: Path, status_ids: list[str]) -> list[str]:
+    """Mark shared Mastodon posts by status ID."""
+    import subprocess
+
+    status_ids = [str(item).strip() for item in status_ids if str(item).strip()]
     if not status_ids:
-        logger.warning("Mastodon daily share: no candidate IDs matched final response URLs")
         return []
 
+    script = workspace_path / "skills" / "mastodon-daily-share" / "scripts" / "mastodon_daily_share.py"
     mark_cmd = [sys.executable, str(script), "mark-shared"]
     for status_id in status_ids:
         mark_cmd.extend(["--status-id", status_id])
+
     mark_proc = subprocess.run(
         mark_cmd,
         cwd=str(workspace_path),
@@ -632,8 +646,6 @@ def _mark_mastodon_daily_share_links(response: str, workspace_path: Path) -> lis
 
     logger.info("Mastodon daily share: marked shared IDs {}", status_ids)
     return status_ids
-
-
 
 def _load_bilibili_prepare_cache(workspace_path: Path) -> dict[str, Any]:
     """Load the most recent Bilibili prepare cache written for callback matching."""
@@ -765,8 +777,10 @@ async def _handle_curated_daily_share_response(
         if response == _MASTODON_DAILY_SHARE_SENTINEL:
             logger.info("Mastodon daily share: nothing worth sending today")
             return
-        if not _extract_urls(response):
-            logger.warning("Mastodon daily share: suppressing response without shareable URLs")
+
+        matched_ids = _collect_mastodon_daily_share_ids(response, workspace_path)
+        if not matched_ids:
+            logger.warning("Mastodon daily share: suppressing response without matchable status ID")
             return
 
         await bus.publish_outbound(OutboundMessage(
@@ -778,7 +792,7 @@ async def _handle_curated_daily_share_response(
             await _mirror_weixin_share_if_enabled(job, response, config_path=config_path)
         except Exception as exc:
             logger.warning("Mastodon daily share: unexpected Weixin mirror error: {}", exc)
-        _mark_mastodon_daily_share_links(response, workspace_path)
+        _mark_mastodon_daily_share_ids(workspace_path, matched_ids)
         return
 
     if _is_bilibili_daily_share_job(job):
