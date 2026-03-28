@@ -57,6 +57,27 @@ def test_add_job_persists_send_progress_flag(tmp_path) -> None:
     assert loaded.payload.send_progress is False
 
 
+def test_add_job_persists_weixin_mirror_flag(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    job = service.add_job(
+        name="dual share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        mirror_weixin_allowfrom=True,
+    )
+
+    assert job.payload.mirror_weixin_allowfrom is True
+    raw = json.loads(store_path.read_text())
+    assert raw["jobs"][0]["payload"]["mirrorWeixinAllowFrom"] is True
+
+    fresh = CronService(store_path)
+    loaded = fresh.get_job(job.id)
+    assert loaded is not None
+    assert loaded.payload.mirror_weixin_allowfrom is True
+
+
 def test_add_job_accepts_daily_random_schedule(tmp_path, monkeypatch) -> None:
     tz = ZoneInfo("Asia/Shanghai")
     now = datetime(2026, 3, 26, 7, 30, tzinfo=tz)

@@ -1,6 +1,6 @@
 ## Local Maintenance Notes
 
-Last updated: 2026-03-26
+Last updated: 2026-03-27
 
 This file tracks local behavior that intentionally diverges from upstream so future upgrades can preserve it.
 
@@ -27,6 +27,10 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Weixin login/runtime state lives under `~/.nanobot/weixin-auth`, with `nanobot-weixin-bridge.service` as the long-running bridge host.
 - This local Weixin path intentionally diverges from upstream's direct HTTP long-poll channel. Keep the bridge architecture and selectively port upstream Weixin fixes instead of replacing it wholesale.
 - Local inbound image parsing is intentionally aligned with Tencent's official `@tencent-weixin/openclaw-weixin` plugin: read `item_list` typed media, use `image_item.media.encrypt_query_param`, and decrypt CDN bytes with `image_item.aeskey` / `image_item.media.aes_key` instead of relying on image-URL discovery.
+- Added `mirrorWeixinAllowFrom` as a local cron payload field so curated background shares can keep Telegram as the primary target while best-effort mirroring the same final text to current `channels.weixin.allowFrom`.
+- Extracted the Weixin allowFrom broadcast path into `nanobot/utils/weixin_broadcast.py`, shared by both the daily digest service and curated cron share callbacks.
+- Added a local `bilibili_daily_share` content-source integration backed by `~/.nanobot/workspace/skills/bilibili-daily-share/`, login state in `~/.nanobot/bilibili-auth/`, and a dedicated `~/.nanobot/venvs/bilibili-cli` runtime pinned to `bilibili-api-python==17.4.1`.
+- The Bilibili daily share path intentionally uses logged-in homepage recommendations rather than any public hot list, and only sends Telegram login reminders when auth expires.
 
 Key files to re-check after every upstream merge:
 
@@ -52,6 +56,7 @@ Key files to re-check after every upstream merge:
 - That service must continue to pass:
   - `NANOBOT_DISABLE_SEMANTIC_MEMORY=1`
 - Daily digest now broadcasts the same weather text to Weixin recipients from `channels.weixin.allowFrom` in addition to Telegram, and the timer target is 06:30 CST.
+- Curated random social shares also use the same Weixin allowFrom broadcast helper, but only for their final share text and never for progress updates or Bilibili login reminders.
 - Service-level provider secrets live in:
   - `/etc/default/nanobot`
 - Weixin bridge service unit lives in:
@@ -62,6 +67,10 @@ Key files to re-check after every upstream merge:
   - `~/NIM.key` for NVIDIA NIM embeddings
   - `~/OLLAMA_CLOUD.key` as the archived retired Ollama Cloud key
   - `~/axonhub.key` for the active AxonHub API key
+- Current local auth state directories in the home directory:
+  - `~/.nanobot/weixin-auth`
+  - `~/.nanobot/bilibili-auth`
+  - `~/.config/toot`
 
 ### Codex-Listener Dependency
 
@@ -101,6 +110,8 @@ Key files to re-check after every upstream merge:
 - Verify semantic recall still works on normal chat turns.
 - Verify `memory_add` still rejects volatile content.
 - Verify daily digest still runs with semantic memory disabled.
+- Verify curated random shares still only send final text, never progress, while mirroring to Weixin when `mirrorWeixinAllowFrom=true`.
+- Verify `bilibili_daily_share` still reads logged-in homepage recommendations, keeps `last_prepare.json` in sync with callback matching, and only emits Telegram login reminders on auth expiry.
 - Verify `~/.nanobot/workspace/skills/Codex-Listener` still resolves to the listener repo.
 - Verify the local Weixin bridge still preserves:
   - `contextTokens` persistence inside `~/.nanobot/weixin-auth/accounts/*.json`

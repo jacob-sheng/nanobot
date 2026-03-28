@@ -30,6 +30,8 @@ class CronPayload:
     deliver: bool = False
     # Whether agent progress updates should be sent to the channel while running
     send_progress: bool = True
+    # Whether the final delivered text should also be mirrored to Weixin allowFrom targets
+    mirror_weixin_allowfrom: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
 

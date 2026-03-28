@@ -271,8 +271,13 @@ class CronTool(Tool):
         lines = []
         for j in jobs:
             timing = self._format_timing(j.schedule)
-            progress = ", silent progress" if not j.payload.send_progress else ""
-            parts = [f"- {j.name} (id: {j.id}, {timing}{progress})"]
+            flags: list[str] = []
+            if not j.payload.send_progress:
+                flags.append("silent progress")
+            if j.payload.mirror_weixin_allowfrom:
+                flags.append("weixin mirror")
+            details = ", ".join([timing, *flags]) if flags else timing
+            parts = [f"- {j.name} (id: {j.id}, {details})"]
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)
