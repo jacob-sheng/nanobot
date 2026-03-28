@@ -7,8 +7,14 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _finalize_weixin_login_state, _make_provider, app
+from nanobot.cli.commands import (
+    _finalize_weixin_login_state,
+    _handle_curated_daily_share_response,
+    _make_provider,
+    app,
+)
 from nanobot.config.schema import Config
+from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
 
@@ -230,6 +236,166 @@ def test_finalize_weixin_login_state_updates_config(tmp_path):
     assert raw["channels"]["weixin"]["bridgeUrl"] == "ws://127.0.0.1:3002"
     assert raw["channels"]["weixin"]["allowFrom"] == ["wx_user@im.wechat"]
     assert raw["channels"]["weixin"]["stateDir"] == str(state_dir)
+
+
+@pytest.mark.asyncio
+async def test_handle_curated_mastodon_share_delivers_marks_and_mirrors(monkeypatch, tmp_path: Path):
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    marked: list[tuple[str, Path]] = []
+    mirrored: list[tuple[str, str]] = []
+
+    def _fake_mark(response: str, workspace_path: Path) -> list[str]:
+        marked.append((response, workspace_path))
+        return ["123"]
+
+    async def _fake_mirror(job, response: str, *, config_path: Path | None = None) -> dict[str, str]:
+        mirrored.append((job.id, response))
+        return {"wx|user": "sent"}
+
+    monkeypatch.setattr("nanobot.cli.commands._mark_mastodon_daily_share_links", _fake_mark)
+    monkeypatch.setattr("nanobot.cli.commands._mirror_weixin_share_if_enabled", _fake_mirror)
+
+    job = CronJob(
+        id="masto1",
+        name="mastodon_daily_share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            deliver=True,
+            channel="telegram_planbridge",
+            to="6682937110",
+            mirror_weixin_allowfrom=True,
+        ),
+    )
+    response = "这个值得一看 https://mastodon.social/@alice/123"
+
+    await _handle_curated_daily_share_response(job, response, bus=bus, workspace_path=tmp_path)
+
+    bus.publish_outbound.assert_awaited_once()
+    outbound = bus.publish_outbound.await_args.args[0]
+    assert outbound.channel == "telegram_planbridge"
+    assert outbound.chat_id == "6682937110"
+    assert outbound.content == response
+    assert marked == [(response, tmp_path)]
+    assert mirrored == [("masto1", response)]
+
+
+@pytest.mark.asyncio
+async def test_handle_curated_bilibili_no_share_stays_silent(tmp_path: Path):
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    job = CronJob(
+        id="bili0",
+        name="bilibili_daily_share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            deliver=True,
+            channel="telegram_planbridge",
+            to="6682937110",
+            mirror_weixin_allowfrom=True,
+        ),
+    )
+
+    await _handle_curated_daily_share_response(job, "NO_SHARE", bus=bus, workspace_path=tmp_path)
+
+    bus.publish_outbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_curated_bilibili_login_required_sends_telegram_only(monkeypatch, tmp_path: Path):
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    mirrored = False
+
+    async def _fake_mirror(*_args, **_kwargs) -> dict[str, str]:
+        nonlocal mirrored
+        mirrored = True
+        return {}
+
+    monkeypatch.setattr("nanobot.cli.commands._mirror_weixin_share_if_enabled", _fake_mirror)
+
+    job = CronJob(
+        id="bili1",
+        name="bilibili_daily_share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            deliver=True,
+            channel="telegram_planbridge",
+            to="6682937110",
+            mirror_weixin_allowfrom=True,
+        ),
+    )
+
+    await _handle_curated_daily_share_response(
+        job,
+        "LOGIN_REQUIRED: B 站登录失效了，今天先不分享。等你方便时运行 ~/.nanobot/bin/auth_bilibili.sh 重新扫码就行。",
+        bus=bus,
+        workspace_path=tmp_path,
+    )
+
+    bus.publish_outbound.assert_awaited_once()
+    outbound = bus.publish_outbound.await_args.args[0]
+    assert outbound.channel == "telegram_planbridge"
+    assert outbound.chat_id == "6682937110"
+    assert outbound.content.startswith("B 站登录失效了")
+    state = json.loads((tmp_path / "services" / "bilibili-daily-share" / "state.json").read_text(encoding="utf-8"))
+    assert state["last_login_reminder_at_ms"] > 0
+    assert mirrored is False
+
+
+@pytest.mark.asyncio
+async def test_handle_curated_bilibili_share_marks_even_if_weixin_mirror_fails(monkeypatch, tmp_path: Path):
+    cache_dir = tmp_path / "services" / "bilibili-daily-share"
+    cache_dir.mkdir(parents=True)
+    cache_dir.joinpath("last_prepare.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "bvid": "BV1AB411c7mD",
+                        "url": "https://www.bilibili.com/video/BV1AB411c7mD",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    marked: list[tuple[Path, list[str]]] = []
+
+    def _fake_mark(workspace_path: Path, bvids: list[str]) -> list[str]:
+        marked.append((workspace_path, bvids))
+        return bvids
+
+    async def _boom(*_args, **_kwargs) -> dict[str, str]:
+        raise RuntimeError("bridge down")
+
+    monkeypatch.setattr("nanobot.cli.commands._mark_bilibili_daily_share_bvids", _fake_mark)
+    monkeypatch.setattr("nanobot.cli.commands._mirror_weixin_share_if_enabled", _boom)
+
+    job = CronJob(
+        id="bili2",
+        name="bilibili_daily_share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            deliver=True,
+            channel="telegram_planbridge",
+            to="6682937110",
+            mirror_weixin_allowfrom=True,
+        ),
+    )
+    response = "这个讲得挺清楚：https://www.bilibili.com/video/BV1AB411c7mD"
+
+    await _handle_curated_daily_share_response(job, response, bus=bus, workspace_path=tmp_path)
+
+    bus.publish_outbound.assert_awaited_once()
+    outbound = bus.publish_outbound.await_args.args[0]
+    assert outbound.content == response
+    assert marked == [(tmp_path, ["BV1AB411c7mD"])]
 
 
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():

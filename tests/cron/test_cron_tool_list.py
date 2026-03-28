@@ -182,6 +182,18 @@ def test_list_job_shows_silent_progress_flag(tmp_path) -> None:
     assert "silent progress" in result
 
 
+def test_list_job_shows_weixin_mirror_flag(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Dual share",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="share",
+        mirror_weixin_allowfrom=True,
+    )
+    result = tool._list_jobs()
+    assert "weixin mirror" in result
+
+
 def test_list_every_job_shows_human_interval(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     tool._cron.add_job(
