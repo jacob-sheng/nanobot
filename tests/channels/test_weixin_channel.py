@@ -108,7 +108,26 @@ async def test_send_uses_websocket_when_connected() -> None:
     assert sent_payload["type"] == "send"
     assert sent_payload["to"] == "acct-1|wx-user"
     assert sent_payload["text"] == "pong"
+    assert sent_payload["media"] == []
     assert "metadata" not in sent_payload
+
+
+@pytest.mark.asyncio
+async def test_send_includes_media_paths_when_present() -> None:
+    channel, _bus = _make_channel()
+    ws = AsyncMock()
+    channel._ws = ws
+    channel._connected = True
+
+    msg = type(
+        "Msg",
+        (),
+        {"chat_id": "acct-1|wx-user", "content": "pong", "media": ["/tmp/a.jpg", "/tmp/b.mp4"], "metadata": {}},
+    )()
+    await channel.send(msg)
+
+    sent_payload = json.loads(ws.send.await_args.args[0])
+    assert sent_payload["media"] == ["/tmp/a.jpg", "/tmp/b.mp4"]
 
 
 @pytest.mark.asyncio

@@ -7,15 +7,18 @@ from typing import Literal
 @dataclass
 class CronSchedule:
     """Schedule definition for a cron job."""
-    kind: Literal["at", "every", "cron"]
+    kind: Literal["at", "every", "cron", "daily_random"]
     # For "at": timestamp in ms
     at_ms: int | None = None
     # For "every": interval in ms
     every_ms: int | None = None
     # For "cron": cron expression (e.g. "0 9 * * *")
     expr: str | None = None
-    # Timezone for cron expressions
+    # Timezone for cron expressions and daily random windows
     tz: str | None = None
+    # For "daily_random": local window start/end as HH:MM
+    window_start: str | None = None
+    window_end: str | None = None
 
 
 @dataclass
@@ -25,6 +28,8 @@ class CronPayload:
     message: str = ""
     # Deliver response to channel
     deliver: bool = False
+    # Whether agent progress updates should be sent to the channel while running
+    send_progress: bool = True
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
 

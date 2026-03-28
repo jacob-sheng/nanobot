@@ -195,6 +195,7 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
+        BotCommand("switch", "Switch model for this chat"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
@@ -278,6 +279,7 @@ class TelegramChannel(BaseChannel):
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("switch", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
@@ -584,6 +586,7 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text(
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
+            "/switch — Show or change the model for this chat\n"
             "/stop — Stop the current task\n"
             "/restart — Restart the bot\n"
             "/status — Show bot status\n"

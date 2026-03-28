@@ -2,9 +2,10 @@
 
 import asyncio
 import json
+import random
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
@@ -17,7 +18,99 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
+def _parse_hhmm(value: str | None) -> tuple[int, int] | None:
+    """Parse HH:MM strings used by daily random windows."""
+    if not value:
+        return None
+    try:
+        hour_str, minute_str = value.split(":", 1)
+        hour = int(hour_str)
+        minute = int(minute_str)
+    except Exception:
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour, minute
+
+
+def _ceil_to_minute(dt: datetime) -> datetime:
+    """Round up to the next whole minute when seconds are present."""
+    if dt.second == 0 and dt.microsecond == 0:
+        return dt
+    return (dt + timedelta(minutes=1)).replace(second=0, microsecond=0)
+
+
+def _pick_random_minute(max_offset_minutes: int) -> int:
+    """Pick a minute offset inside a window, inclusive."""
+    return random.SystemRandom().randrange(max_offset_minutes + 1)
+
+
+def _compute_next_daily_random_run(
+    schedule: CronSchedule,
+    now_ms: int,
+    *,
+    after_execution: bool = False,
+) -> int | None:
+    """Compute the next run time for a once-per-day random window."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
+        if tz is None:
+            return None
+    except Exception:
+        return None
+
+    start_parts = _parse_hhmm(schedule.window_start)
+    end_parts = _parse_hhmm(schedule.window_end)
+    if not start_parts or not end_parts:
+        return None
+
+    start_minutes = start_parts[0] * 60 + start_parts[1]
+    end_minutes = end_parts[0] * 60 + end_parts[1]
+    if end_minutes < start_minutes:
+        return None
+
+    now_dt = datetime.fromtimestamp(now_ms / 1000, tz=tz)
+    base_date = now_dt.date()
+    if after_execution:
+        base_date = (now_dt + timedelta(days=1)).date()
+
+    while True:
+        day_start = datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            start_parts[0],
+            start_parts[1],
+            tzinfo=tz,
+        )
+        day_end = datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            end_parts[0],
+            end_parts[1],
+            tzinfo=tz,
+        )
+
+        candidate_start = day_start
+        if not after_execution and base_date == now_dt.date():
+            if now_dt > day_end:
+                base_date = (now_dt + timedelta(days=1)).date()
+                continue
+            candidate_start = max(day_start, _ceil_to_minute(now_dt))
+            if candidate_start > day_end:
+                base_date = (now_dt + timedelta(days=1)).date()
+                continue
+
+        max_offset_minutes = int((day_end - candidate_start).total_seconds() // 60)
+        offset_minutes = _pick_random_minute(max_offset_minutes)
+        next_dt = candidate_start + timedelta(minutes=offset_minutes)
+        return int(next_dt.timestamp() * 1000)
+
+
+def _compute_next_run(schedule: CronSchedule, now_ms: int, *, after_execution: bool = False) -> int | None:
     """Compute next run time in ms."""
     if schedule.kind == "at":
         return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
@@ -43,21 +136,34 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
         except Exception:
             return None
 
+    if schedule.kind == "daily_random":
+        return _compute_next_daily_random_run(schedule, now_ms, after_execution=after_execution)
+
     return None
 
 
 def _validate_schedule_for_add(schedule: CronSchedule) -> None:
     """Validate schedule fields that would otherwise create non-runnable jobs."""
-    if schedule.tz and schedule.kind != "cron":
-        raise ValueError("tz can only be used with cron schedules")
+    if schedule.tz and schedule.kind not in {"cron", "daily_random"}:
+        raise ValueError("tz can only be used with cron or daily_random schedules")
 
-    if schedule.kind == "cron" and schedule.tz:
+    if schedule.kind in {"cron", "daily_random"} and schedule.tz:
         try:
             from zoneinfo import ZoneInfo
 
             ZoneInfo(schedule.tz)
         except Exception:
             raise ValueError(f"unknown timezone '{schedule.tz}'") from None
+
+    if schedule.kind == "daily_random":
+        start_parts = _parse_hhmm(schedule.window_start)
+        end_parts = _parse_hhmm(schedule.window_end)
+        if not start_parts or not end_parts:
+            raise ValueError("daily_random schedules require valid HH:MM window_start and window_end")
+        start_minutes = start_parts[0] * 60 + start_parts[1]
+        end_minutes = end_parts[0] * 60 + end_parts[1]
+        if end_minutes < start_minutes:
+            raise ValueError("daily_random window_end must be at or after window_start")
 
 
 class CronService:
@@ -102,11 +208,14 @@ class CronService:
                             every_ms=j["schedule"].get("everyMs"),
                             expr=j["schedule"].get("expr"),
                             tz=j["schedule"].get("tz"),
+                            window_start=j["schedule"].get("windowStart"),
+                            window_end=j["schedule"].get("windowEnd"),
                         ),
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
                             message=j["payload"].get("message", ""),
                             deliver=j["payload"].get("deliver", False),
+                            send_progress=j["payload"].get("sendProgress", True),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
                         ),
@@ -158,11 +267,14 @@ class CronService:
                         "everyMs": j.schedule.every_ms,
                         "expr": j.schedule.expr,
                         "tz": j.schedule.tz,
+                        "windowStart": j.schedule.window_start,
+                        "windowEnd": j.schedule.window_end,
                     },
                     "payload": {
                         "kind": j.payload.kind,
                         "message": j.payload.message,
                         "deliver": j.payload.deliver,
+                        "sendProgress": j.payload.send_progress,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
                     },
@@ -214,8 +326,11 @@ class CronService:
             return
         now = _now_ms()
         for job in self._store.jobs:
-            if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+            if not job.enabled:
+                continue
+            if job.schedule.kind == "daily_random" and job.state.next_run_at_ms is not None:
+                continue
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -301,7 +416,7 @@ class CronService:
                 job.state.next_run_at_ms = None
         else:
             # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms(), after_execution=True)
 
     # ========== Public API ==========
 
@@ -317,6 +432,7 @@ class CronService:
         schedule: CronSchedule,
         message: str,
         deliver: bool = False,
+        send_progress: bool = True,
         channel: str | None = None,
         to: str | None = None,
         delete_after_run: bool = False,
@@ -335,6 +451,7 @@ class CronService:
                 kind="agent_turn",
                 message=message,
                 deliver=deliver,
+                send_progress=send_progress,
                 channel=channel,
                 to=to,
             ),
