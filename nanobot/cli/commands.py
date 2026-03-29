@@ -563,7 +563,7 @@ def _extract_mastodon_status_ids(text: str) -> list[str]:
 
     ids: list[str] = []
     seen: set[str] = set()
-    for match in re.findall(r"https?://[^\s/]+/@[^\s/]+/(\d{15,25})", text or ""):
+    for match in re.findall(r"https?://[^\s/]+/@[^\s/]+/(\d+)", text or ""):
         if match not in seen:
             seen.add(match)
             ids.append(match)
@@ -584,6 +584,8 @@ def _collect_mastodon_daily_share_ids(response: str, workspace_path: Path) -> li
     status_ids_in_response = set(_extract_mastodon_status_ids(response))
     if not response_urls and not status_ids_in_response:
         return []
+    if not payload.get("candidates") and status_ids_in_response:
+        return list(status_ids_in_response)
 
     def _urls_in_text(text: str) -> set[str]:
         return {m.rstrip(')]}>,. !?\"\',') for m in re.findall(r"https?://\S+", text or "")}
@@ -646,6 +648,13 @@ def _mark_mastodon_daily_share_ids(workspace_path: Path, status_ids: list[str]) 
 
     logger.info("Mastodon daily share: marked shared IDs {}", status_ids)
     return status_ids
+
+
+def _mark_mastodon_daily_share_links(response: str, workspace_path: Path) -> list[str]:
+    """Compatibility wrapper that extracts Mastodon status IDs from a response."""
+    status_ids = _collect_mastodon_daily_share_ids(response, workspace_path)
+    return _mark_mastodon_daily_share_ids(workspace_path, status_ids)
+
 
 def _load_bilibili_prepare_cache(workspace_path: Path) -> dict[str, Any]:
     """Load the most recent Bilibili prepare cache written for callback matching."""
@@ -792,7 +801,7 @@ async def _handle_curated_daily_share_response(
             await _mirror_weixin_share_if_enabled(job, response, config_path=config_path)
         except Exception as exc:
             logger.warning("Mastodon daily share: unexpected Weixin mirror error: {}", exc)
-        _mark_mastodon_daily_share_ids(workspace_path, matched_ids)
+        _mark_mastodon_daily_share_links(response, workspace_path)
         return
 
     if _is_bilibili_daily_share_job(job):

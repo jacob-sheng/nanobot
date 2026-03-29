@@ -58,7 +58,7 @@ When upstream `HKUDS/nanobot` changes Weixin support, re-check these areas first
 
 - keep the bridge architecture; do not swap in upstream direct Weixin without a dedicated migration
 - do not expose transport-only metadata like `context_token` to prompt construction
-- keep the "inject current time only after 10 minutes of idle" policy for Weixin sessions
+- keep the shared "inject current time only after 10 minutes of idle" policy for chat channels, with Weixin participating in the same idle-gap hint behavior
 - keep QR refresh writing `~/weixin-qr.png`
 - keep bridge restart behavior compatible with `~/.nanobot/weixin-auth`
 - keep inbound image parsing aligned with Tencent's `@tencent-weixin/openclaw-weixin` plugin:

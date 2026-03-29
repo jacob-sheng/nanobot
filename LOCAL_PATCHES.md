@@ -22,6 +22,7 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Added `NANOBOT_DISABLE_SEMANTIC_MEMORY=1` support to hard-disable semantic memory for selected processes.
 - Added automatic turn-level memory capture for durable user facts/preferences, with Mem0 dedupe and a lightweight `（我记下了）` hint after successful writes.
 - Explicit `memory_add` now suppresses same-turn auto-capture so one fact is not written twice.
+- Chat channels (`weixin`, `telegram`, `telegram_planbridge`) now only inject runtime time after 10 minutes of idle, and include a human-readable idle-gap hint once that threshold is crossed.
 - Switched the default chat provider to the AxonHub OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://any.herta.us.ci/v1`.
 - Added a local Weixin bridge channel backed by `nanobot/channels/weixin.py` and `bridge/src/weixin*.ts`.
 - Weixin login/runtime state lives under `~/.nanobot/weixin-auth`, with `nanobot-weixin-bridge.service` as the long-running bridge host.
@@ -31,6 +32,7 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Extracted the Weixin allowFrom broadcast path into `nanobot/utils/weixin_broadcast.py`, shared by both the daily digest service and curated cron share callbacks.
 - Added a local `bilibili_daily_share` content-source integration backed by `~/.nanobot/workspace/skills/bilibili-daily-share/`, login state in `~/.nanobot/bilibili-auth/`, and a dedicated `~/.nanobot/venvs/bilibili-cli` runtime pinned to `bilibili-api-python==17.4.1`.
 - The Bilibili daily share path intentionally uses logged-in homepage recommendations rather than any public hot list, and only sends Telegram login reminders when auth expires.
+- Curated Mastodon share marking keeps a local fallback path that can extract canonical status IDs directly from the final response URL when `last_prepare.json` is missing.
 
 Key files to re-check after every upstream merge:
 
