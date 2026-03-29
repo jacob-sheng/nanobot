@@ -22,6 +22,7 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Added `NANOBOT_DISABLE_SEMANTIC_MEMORY=1` support to hard-disable semantic memory for selected processes.
 - Added automatic turn-level memory capture for durable user facts/preferences, with Mem0 dedupe and a lightweight `（我记下了）` hint after successful writes.
 - Explicit `memory_add` now suppresses same-turn auto-capture so one fact is not written twice.
+- Local `pyproject.toml` keeps the Mem0 runtime dependencies so rebuilds and restore flows do not silently drop semantic memory support.
 - Chat channels (`weixin`, `telegram`, `telegram_planbridge`) now only inject runtime time after 10 minutes of idle, and include a human-readable idle-gap hint once that threshold is crossed.
 - Switched the default chat provider to the AxonHub OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://any.herta.us.ci/v1`.
 - Added a local Weixin bridge channel backed by `nanobot/channels/weixin.py` and `bridge/src/weixin*.ts`.
