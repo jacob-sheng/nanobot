@@ -53,7 +53,8 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
-    _WEIXIN_RUNTIME_TIME_IDLE_SECONDS = 10 * 60
+    _IDLE_TIME_HINT_SECONDS = 10 * 60
+    _IDLE_HINT_CHANNELS = {"weixin", "telegram", "telegram_planbridge"}
 
     def __init__(
         self,
@@ -221,23 +222,46 @@ class AgentLoop:
         """Remove the model override for one session."""
         self._session_model_overrides.pop(session_key, None)
 
-    def _should_include_runtime_time(self, channel: str, session: Session) -> bool:
-        """Return whether the current turn should include runtime time context."""
-        if channel != "weixin":
-            return True
+    def _get_idle_seconds(self, session: Session) -> float | None:
+        """Return seconds since the last message, or None if unavailable."""
         if not session.messages:
-            return False
-
+            return None
         last_timestamp = session.messages[-1].get("timestamp")
         if not isinstance(last_timestamp, str) or not last_timestamp:
-            return False
-
+            return None
         try:
             last_dt = datetime.fromisoformat(last_timestamp)
         except ValueError:
-            return False
+            return None
+        return (datetime.now() - last_dt).total_seconds()
 
-        return (datetime.now() - last_dt).total_seconds() >= self._WEIXIN_RUNTIME_TIME_IDLE_SECONDS
+    def _should_include_runtime_time(self, channel: str, session: Session) -> bool:
+        """Return whether the current turn should include runtime time context.
+
+        Chat channels (weixin, telegram, telegram_planbridge) only inject
+        runtime time after an idle gap to save tokens.  All other channels
+        (cli, cron, system) always include it.
+        """
+        if channel not in self._IDLE_HINT_CHANNELS:
+            return True
+        idle = self._get_idle_seconds(session)
+        if idle is None:
+            return False
+        return idle >= self._IDLE_TIME_HINT_SECONDS
+
+    def _build_idle_hint(self, channel: str, session: Session) -> str | None:
+        """Build a human-readable idle duration hint when the gap is large enough."""
+        if channel not in self._IDLE_HINT_CHANNELS:
+            return None
+        idle = self._get_idle_seconds(session)
+        if idle is None or idle < self._IDLE_TIME_HINT_SECONDS:
+            return None
+        total = int(idle)
+        hours, remainder = divmod(total, 3600)
+        minutes = remainder // 60
+        if hours > 0:
+            return f"距上次对话已过去 {hours} 小时 {minutes} 分钟"
+        return f"距上次对话已过去 {minutes} 分钟"
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -557,6 +581,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
                 include_runtime_time=self._should_include_runtime_time(channel, session),
+                idle_hint=self._build_idle_hint(channel, session),
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
@@ -604,6 +629,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             include_runtime_time=self._should_include_runtime_time(msg.channel, session),
+            idle_hint=self._build_idle_hint(msg.channel, session),
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:

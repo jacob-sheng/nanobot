@@ -8,7 +8,8 @@ from nanobot.session.manager import Session
 def _mk_loop() -> AgentLoop:
     loop = AgentLoop.__new__(AgentLoop)
     loop._TOOL_RESULT_MAX_CHARS = AgentLoop._TOOL_RESULT_MAX_CHARS
-    loop._WEIXIN_RUNTIME_TIME_IDLE_SECONDS = AgentLoop._WEIXIN_RUNTIME_TIME_IDLE_SECONDS
+    loop._IDLE_TIME_HINT_SECONDS = AgentLoop._IDLE_TIME_HINT_SECONDS
+    loop._IDLE_HINT_CHANNELS = AgentLoop._IDLE_HINT_CHANNELS
     return loop
 
 
@@ -61,11 +62,71 @@ def test_weixin_runtime_time_is_skipped_on_invalid_timestamp() -> None:
     assert loop._should_include_runtime_time("weixin", session) is False
 
 
-def test_non_weixin_runtime_time_stays_enabled() -> None:
+def test_non_chat_channel_runtime_time_stays_enabled() -> None:
+    """CLI and other non-chat channels always include runtime time."""
     loop = _mk_loop()
-    session = Session(key="telegram:test")
+    session = Session(key="cli:direct")
 
-    assert loop._should_include_runtime_time("telegram", session) is True
+    assert loop._should_include_runtime_time("cli", session) is True
+
+
+def test_telegram_runtime_time_is_skipped_within_idle_window() -> None:
+    loop = _mk_loop()
+    session = Session(key="telegram_planbridge:test")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "recent",
+            "timestamp": (datetime.now() - timedelta(minutes=5)).isoformat(),
+        }
+    )
+
+    assert loop._should_include_runtime_time("telegram_planbridge", session) is False
+
+
+def test_telegram_runtime_time_is_included_after_idle_window() -> None:
+    loop = _mk_loop()
+    session = Session(key="telegram_planbridge:test")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "older",
+            "timestamp": (datetime.now() - timedelta(minutes=11)).isoformat(),
+        }
+    )
+
+    assert loop._should_include_runtime_time("telegram_planbridge", session) is True
+
+
+def test_idle_hint_returns_none_within_threshold() -> None:
+    loop = _mk_loop()
+    session = Session(key="telegram_planbridge:test")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "recent",
+            "timestamp": (datetime.now() - timedelta(minutes=5)).isoformat(),
+        }
+    )
+
+    assert loop._build_idle_hint("telegram_planbridge", session) is None
+
+
+def test_idle_hint_returns_human_readable_duration() -> None:
+    loop = _mk_loop()
+    session = Session(key="telegram_planbridge:test")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "older",
+            "timestamp": (datetime.now() - timedelta(hours=2, minutes=15)).isoformat(),
+        }
+    )
+
+    hint = loop._build_idle_hint("telegram_planbridge", session)
+    assert hint is not None
+    assert "2 小时" in hint
+    assert "15 分钟" in hint
 
 
 def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
