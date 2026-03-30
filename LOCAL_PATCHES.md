@@ -24,7 +24,7 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Explicit `memory_add` now suppresses same-turn auto-capture so one fact is not written twice.
 - Local `pyproject.toml` keeps the Mem0 runtime dependencies so rebuilds and restore flows do not silently drop semantic memory support.
 - Chat channels (`weixin`, `telegram`, `telegram_planbridge`) now only inject runtime time after 10 minutes of idle, and include a human-readable idle-gap hint once that threshold is crossed.
-- Switched the default chat provider to the AxonHub OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://any.herta.us.ci/v1`.
+- Switched the default chat provider to the AxonHub OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://axon.061609.xyz/v1`.
 - Added a local Weixin bridge channel backed by `nanobot/channels/weixin.py` and `bridge/src/weixin*.ts`.
 - Weixin login/runtime state lives under `~/.nanobot/weixin-auth`, with `nanobot-weixin-bridge.service` as the long-running bridge host.
 - This local Weixin path intentionally diverges from upstream's direct HTTP long-poll channel. Keep the bridge architecture and selectively port upstream Weixin fixes instead of replacing it wholesale.
@@ -93,7 +93,7 @@ Key files to re-check after every upstream merge:
 - Default chat provider:
   - `agents.defaults.provider` must stay `custom`
   - `agents.defaults.model` must stay `ollama/kimi-k2.5`
-  - `providers.custom.apiBase` must stay `https://any.herta.us.ci/v1`
+  - `providers.custom.apiBase` must stay `https://axon.061609.xyz/v1`
   - Do not switch back to `auto` while using the `ollama/...` model name, or nanobot may incorrectly resolve to the built-in local Ollama provider.
 - Provider secrets:
   - `providers.vllm.apiKey` should remain absent from `~/.nanobot/config.json`
