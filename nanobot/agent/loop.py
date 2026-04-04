@@ -260,8 +260,8 @@ class AgentLoop:
         hours, remainder = divmod(total, 3600)
         minutes = remainder // 60
         if hours > 0:
-            return f"距上次对话已过去 {hours} 小时 {minutes} 分钟"
-        return f"距上次对话已过去 {minutes} 分钟"
+            return f"【环境感知】: 距上次对话已真实流逝 {hours} 小时 {minutes} 分钟。"
+        return f"【环境感知】: 距上次对话已真实流逝 {minutes} 分钟。"
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
