@@ -19,6 +19,7 @@ from telegram.request import HTTPXRequest
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.security.network import validate_url_target
@@ -197,9 +198,12 @@ class TelegramChannel(BaseChannel):
         BotCommand("new", "Start a new conversation"),
         BotCommand("switch", "Switch model for this chat"),
         BotCommand("stop", "Stop the current task"),
-        BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
+        BotCommand("dream", "Run Dream memory consolidation now"),
+        BotCommand("dream_log", "Show the latest Dream memory change"),
+        BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
+        BotCommand("help", "Show available commands"),
     ]
 
     @classmethod
@@ -242,6 +246,17 @@ class TelegramChannel(BaseChannel):
 
         return sid in allow_list or username in allow_list
 
+    @staticmethod
+    def _normalize_telegram_command(content: str) -> str:
+        """Map Telegram-safe command aliases back to canonical nanobot commands."""
+        if not content.startswith("/"):
+            return content
+        if content == "/dream_log" or content.startswith("/dream_log "):
+            return content.replace("/dream_log", "/dream-log", 1)
+        if content == "/dream_restore" or content.startswith("/dream_restore "):
+            return content.replace("/dream_restore", "/dream-restore", 1)
+        return content
+
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
         if not self.config.token:
@@ -276,14 +291,21 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers
-        self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("switch", self._forward_command))
-        self._app.add_handler(CommandHandler("stop", self._forward_command))
-        self._app.add_handler(CommandHandler("restart", self._forward_command))
-        self._app.add_handler(CommandHandler("status", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._on_help))
+        # Add command handlers (using Regex to support @username suffixes before bot initialization)
+        self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/(new|switch|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
+                self._forward_command,
+            )
+        )
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/(dream-log|dream_log|dream-restore|dream_restore)(?:@\w+)?(?:\s+.*)?$"),
+                self._forward_command,
+            )
+        )
+        self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -583,15 +605,7 @@ class TelegramChannel(BaseChannel):
         """Handle /help command, bypassing ACL so all users can access it."""
         if not update.message:
             return
-        await update.message.reply_text(
-            "🐈 nanobot commands:\n"
-            "/new — Start a new conversation\n"
-            "/switch — Show or change the model for this chat\n"
-            "/stop — Stop the current task\n"
-            "/restart — Restart the bot\n"
-            "/status — Show bot status\n"
-            "/help — Show available commands"
-        )
+        await update.message.reply_text(build_help_text())
 
     @staticmethod
     def _sender_id(user) -> str:
@@ -771,7 +785,7 @@ class TelegramChannel(BaseChannel):
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
-            content=message.text or "",
+            content=self._normalize_telegram_command(message.text or ""),
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
         )

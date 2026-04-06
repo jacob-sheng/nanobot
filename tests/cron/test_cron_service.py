@@ -7,7 +7,7 @@ import pytest
 
 from nanobot.cron import service as cron_service_module
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronSchedule
+from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 
 
 def test_add_job_rejects_unknown_timezone(tmp_path) -> None:
@@ -276,3 +276,18 @@ async def test_running_service_honors_external_disable(tmp_path) -> None:
         assert called == []
     finally:
         service.stop()
+
+
+def test_remove_job_refuses_system_jobs(tmp_path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    service.register_system_job(CronJob(
+        id="dream",
+        name="dream",
+        schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
+        payload=CronPayload(kind="system_event"),
+    ))
+
+    result = service.remove_job("dream")
+
+    assert result == "protected"
+    assert service.get_job("dream") is not None

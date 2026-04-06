@@ -6,7 +6,7 @@ from typing import Any
 
 from nanobot.agent.tools.base import Tool
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJobState, CronSchedule
+from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 
 
 class CronTool(Tool):
@@ -135,6 +135,7 @@ class CronTool(Tool):
         daily_random_start: str | None = None,
         daily_random_end: str | None = None,
         job_id: str | None = None,
+        deliver: bool = True,
         **kwargs: Any,
     ) -> str:
         if action == "add":
@@ -149,6 +150,7 @@ class CronTool(Tool):
                 daily_random_start,
                 daily_random_end,
                 send_progress,
+                deliver,
             )
         elif action == "list":
             return self._list_jobs()
@@ -166,6 +168,7 @@ class CronTool(Tool):
         daily_random_start: str | None = None,
         daily_random_end: str | None = None,
         send_progress: bool = True,
+        deliver: bool = True,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -219,7 +222,7 @@ class CronTool(Tool):
             name=message[:30],
             schedule=schedule,
             message=message,
-            deliver=True,
+            deliver=deliver,
             send_progress=send_progress,
             channel=self._channel,
             to=self._chat_id,
@@ -264,6 +267,12 @@ class CronTool(Tool):
             lines.append(f"  Next run: {self._format_timestamp(state.next_run_at_ms, display_tz)}")
         return lines
 
+    @staticmethod
+    def _system_job_purpose(job: CronJob) -> str:
+        if job.name == "dream":
+            return "Dream memory consolidation for long-term memory."
+        return "System-managed internal job."
+
     def _list_jobs(self) -> str:
         jobs = self._cron.list_jobs()
         if not jobs:
@@ -278,6 +287,9 @@ class CronTool(Tool):
                 flags.append("weixin mirror")
             details = ", ".join([timing, *flags]) if flags else timing
             parts = [f"- {j.name} (id: {j.id}, {details})"]
+            if j.payload.kind == "system_event":
+                parts.append(f"  Purpose: {self._system_job_purpose(j)}")
+                parts.append("  Protected: visible for inspection, but cannot be removed.")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)
@@ -285,6 +297,19 @@ class CronTool(Tool):
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
             return "Error: job_id is required for remove"
-        if self._cron.remove_job(job_id):
+        result = self._cron.remove_job(job_id)
+        if result == "removed":
             return f"Removed job {job_id}"
+        if result == "protected":
+            job = self._cron.get_job(job_id)
+            if job and job.name == "dream":
+                return (
+                    "Cannot remove job `dream`.\n"
+                    "This is a system-managed Dream memory consolidation job for long-term memory.\n"
+                    "It remains visible so you can inspect it, but it cannot be removed."
+                )
+            return (
+                f"Cannot remove job `{job_id}`.\n"
+                "This is a protected system-managed cron job."
+            )
         return f"Job {job_id} not found"
