@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from openai import OpenAI
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, is_non_durable_workflow_content
 from nanobot.config.schema import MemoryConfig, SemanticMemoryConfig
 
 if TYPE_CHECKING:
@@ -343,7 +344,11 @@ class SemanticMemory:
         content = cls._normalize_content(text)
         if not content:
             return False
-        return cls._looks_like_news_digest(content) or cls._looks_like_weather_or_status(content)
+        return (
+            cls._looks_like_news_digest(content)
+            or cls._looks_like_weather_or_status(content)
+            or is_non_durable_workflow_content(content)
+        )
 
     def should_store_text(
         self,
@@ -386,6 +391,110 @@ class SemanticMemory:
             metadata=payload,
             infer=False,
         )
+
+    @staticmethod
+    def _flatten_item_metadata(item: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict((item or {}).get("metadata") or {})
+        if not item:
+            return payload
+        for key in ("user_id", "agent_id", "run_id", "actor_id", "role", "created_at", "updated_at", "hash"):
+            value = item.get(key)
+            if value is not None:
+                payload[key] = value
+        return payload
+
+    async def get_memory(self, memory_id: str) -> dict[str, Any] | None:
+        if not self.enabled or not self._memory or not memory_id:
+            return None
+        return await asyncio.to_thread(self._memory.get, memory_id)
+
+    async def get_all_memories(self, limit: int = 200) -> list[dict[str, Any]]:
+        if not self.enabled or not self._memory:
+            return []
+        result = await asyncio.to_thread(
+            self._memory.get_all,
+            user_id=self._config.user_id,
+            limit=limit,
+        )
+        if not isinstance(result, dict):
+            return []
+        items = result.get("results")
+        return items if isinstance(items, list) else []
+
+    async def update_memory(
+        self,
+        memory_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self.enabled or not self._memory or not memory_id or not text.strip():
+            return {"message": "Semantic memory unavailable."}
+        current = await self.get_memory(memory_id)
+        merged = self._flatten_item_metadata(current)
+        merged.update(dict(metadata or {}))
+        return await asyncio.to_thread(self._memory.update, memory_id, text.strip(), merged)
+
+    async def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        if not self.enabled or not self._memory or not memory_id:
+            return {"message": "Semantic memory unavailable."}
+        return await asyncio.to_thread(self._memory.delete, memory_id)
+
+    async def memory_history(self, memory_id: str) -> list[dict[str, Any]]:
+        if not self.enabled or not self._memory or not memory_id:
+            return []
+        result = await asyncio.to_thread(self._memory.history, memory_id)
+        return result if isinstance(result, list) else []
+
+    async def restore_memory(
+        self,
+        memory_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self.enabled or not self._memory or not memory_id or not text.strip():
+            return {"message": "Semantic memory unavailable."}
+        return await asyncio.to_thread(
+            self._restore_memory_sync,
+            memory_id,
+            text.strip(),
+            dict(metadata or {}),
+        )
+
+    def _restore_memory_sync(
+        self,
+        memory_id: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        current = self._memory.get(memory_id)
+        if current:
+            merged = self._flatten_item_metadata(current)
+            merged.update(metadata)
+            self._memory.update(memory_id, text, merged)
+            return {"message": "Memory restored via update."}
+
+        payload = dict(metadata)
+        payload["data"] = text
+        payload["hash"] = hashlib.md5(text.encode()).hexdigest()
+        payload.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        embeddings = self._memory.embedding_model.embed(text, "add")
+        self._memory.vector_store.insert(
+            vectors=[embeddings],
+            ids=[memory_id],
+            payloads=[payload],
+        )
+        self._memory.db.add_history(
+            memory_id,
+            None,
+            text,
+            "ADD",
+            created_at=payload.get("created_at"),
+            updated_at=payload.get("updated_at"),
+            actor_id=payload.get("actor_id"),
+            role=payload.get("role"),
+        )
+        return {"message": "Memory restored successfully."}
 
     async def add_history_entry(self, entry: str) -> None:
         if not self.enabled or not self._config.sync_history_entries:

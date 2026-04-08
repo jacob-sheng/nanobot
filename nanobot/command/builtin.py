@@ -66,8 +66,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     search_usage_text: str | None = None
     try:
         from nanobot.utils.searchusage import fetch_search_usage
-        web_cfg = getattr(getattr(loop, "config", None), "tools", None)
-        web_cfg = getattr(web_cfg, "web", None) if web_cfg else None
+        web_cfg = getattr(loop, "web_config", None)
         search_cfg = getattr(web_cfg, "search", None) if web_cfg else None
         if search_cfg is not None:
             provider = getattr(search_cfg, "provider", "duckduckgo")
@@ -165,6 +164,46 @@ def _format_changed_files(diff: str) -> str:
     return ", ".join(f"`{path}`" for path in files)
 
 
+def _summarize_mem0_actions(actions: list[dict] | None) -> str:
+    if not actions:
+        return "No semantic memory changes."
+    counts = {"add": 0, "update": 0, "delete": 0}
+    for action in actions:
+        op = str(action.get("op") or "").lower()
+        if op in counts:
+            counts[op] += 1
+    parts = []
+    if counts["add"]:
+        parts.append(f"{counts['add']} added")
+    if counts["update"]:
+        parts.append(f"{counts['update']} updated")
+    if counts["delete"]:
+        parts.append(f"{counts['delete']} deleted")
+    return ", ".join(parts) if parts else "No semantic memory changes."
+
+
+def _format_mem0_action_lines(actions: list[dict] | None, *, limit: int = 5) -> list[str]:
+    if not actions:
+        return []
+    lines: list[str] = []
+    for action in actions[:limit]:
+        op = str(action.get("op") or "").upper()
+        memory_id = str(action.get("memory_id") or "")[:8]
+        text = str(action.get("new_text") or action.get("old_text") or "").strip()
+        compact = " ".join(text.split())
+        if len(compact) > 120:
+            compact = compact[:117].rstrip() + "..."
+        suffix = f" `{memory_id}`" if memory_id else ""
+        if compact:
+            lines.append(f"- {op}{suffix}: {compact}")
+        else:
+            lines.append(f"- {op}{suffix}")
+    remaining = len(actions) - len(lines)
+    if remaining > 0:
+        lines.append(f"- ... and {remaining} more semantic action(s)")
+    return lines
+
+
 def _format_dream_log_content(commit, diff: str, *, requested_sha: str | None = None) -> str:
     files_line = _format_changed_files(diff)
     lines = [
@@ -193,6 +232,47 @@ def _format_dream_log_content(commit, diff: str, *, requested_sha: str | None = 
     return "\n".join(lines)
 
 
+def _format_dream_batch_log_content(batch: dict, diff: str = "", *, requested_id: str | None = None) -> str:
+    files_line = _format_changed_files(diff) if diff else "No tracked memory files changed."
+    batch_id = str(batch.get("batch_id") or "")[:8]
+    commit = str(batch.get("git_commit") or "")
+    display_id = commit[:8] if commit else batch_id
+    lines = [
+        "## Dream Update",
+        "",
+        "Here is the selected Dream memory change." if requested_id else "Here is the latest Dream memory change.",
+        "",
+        f"- Batch: `{batch_id}`" if batch_id else f"- Batch: `{display_id}`",
+        f"- Commit: `{commit[:8]}`" if commit else "- Commit: `(semantic-only batch)`",
+        f"- Time: {batch.get('created_at') or '(unknown)'}",
+        f"- Changed files: {files_line}",
+        f"- Semantic memory: {_summarize_mem0_actions(batch.get('mem0_actions'))}",
+    ]
+    mem0_lines = _format_mem0_action_lines(batch.get("mem0_actions"))
+    if mem0_lines:
+        lines.extend(["", "### Semantic Memory"] + mem0_lines)
+    if diff:
+        lines.extend([
+            "",
+            f"Use `/dream-restore {display_id}` to undo this Dream batch.",
+            "",
+            "```diff",
+            diff.rstrip(),
+            "```",
+        ])
+    elif not mem0_lines:
+        lines.extend([
+            "",
+            "Dream recorded this version, but there is no file diff or semantic memory change to display.",
+        ])
+    else:
+        lines.extend([
+            "",
+            f"Use `/dream-restore {display_id}` to undo this Dream batch.",
+        ])
+    return "\n".join(lines)
+
+
 def _format_dream_restore_list(commits: list) -> str:
     lines = [
         "## Dream Restore",
@@ -210,6 +290,28 @@ def _format_dream_restore_list(commits: list) -> str:
     return "\n".join(lines)
 
 
+def _format_dream_restore_batches(batches: list[dict]) -> str:
+    lines = [
+        "## Dream Restore",
+        "",
+        "Choose a Dream batch to restore. Latest first:",
+        "",
+    ]
+    for batch in batches:
+        commit = str(batch.get("git_commit") or "")
+        batch_id = str(batch.get("batch_id") or "")[:8]
+        display = commit[:8] if commit else batch_id
+        when = str(batch.get("created_at") or "(unknown)")
+        summary = _summarize_mem0_actions(batch.get("mem0_actions"))
+        lines.append(f"- `{display}` {when} - {summary}")
+    lines.extend([
+        "",
+        "Preview a batch with `/dream-log <sha>` before restoring it.",
+        "Restore a batch with `/dream-restore <sha>`.",
+    ])
+    return "\n".join(lines)
+
+
 async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
     """Show what the last Dream changed.
 
@@ -218,6 +320,23 @@ async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
     """
     store = ctx.loop.consolidator.store
     git = store.git
+    dream = getattr(ctx.loop, "dream", None)
+
+    if dream is not None and hasattr(dream, "get_batch"):
+        args = ctx.args.strip()
+        batch = dream.get_batch(args or None)
+        if batch:
+            commit = str(batch.get("git_commit") or "")
+            diff = ""
+            if commit:
+                result = git.show_commit_diff(commit)
+                if result:
+                    _, diff = result
+            content = _format_dream_batch_log_content(batch, diff, requested_id=args or None)
+            return OutboundMessage(
+                channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+                content=content, metadata={"render_as": "text"},
+            )
 
     if not git.is_initialized():
         if store.get_last_dream_cursor() == 0:
@@ -269,6 +388,45 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
     """
     store = ctx.loop.consolidator.store
     git = store.git
+    dream = getattr(ctx.loop, "dream", None)
+
+    if dream is not None and hasattr(dream, "list_batches") and hasattr(dream, "restore_batch"):
+        args = ctx.args.strip()
+        if not args:
+            batches = dream.list_batches(limit=10)
+            if not batches:
+                content = "Dream memory has no saved versions to restore yet."
+            else:
+                content = _format_dream_restore_batches(batches)
+        else:
+            restored = await dream.restore_batch(args.split()[0])
+            if restored:
+                batch = restored["batch"]
+                display = str(batch.get("git_commit") or "")[:8] or str(batch.get("batch_id") or "")[:8]
+                new_sha = restored.get("new_git_sha")
+                mem0_summary = _summarize_mem0_actions(restored.get("mem0_actions"))
+                lines = [
+                    f"Restored Dream memory batch `{display}`.",
+                    "",
+                    f"- New safety commit: `{new_sha}`" if new_sha else "- New safety commit: `(no markdown changes)`",
+                    f"- Semantic memory rollback: {mem0_summary}",
+                ]
+                mem0_lines = _format_mem0_action_lines(restored.get("mem0_actions"))
+                if mem0_lines:
+                    lines.extend(["", "### Semantic Memory", *mem0_lines])
+                if new_sha:
+                    lines.extend(["", f"Use `/dream-log {new_sha}` to inspect the restore diff."])
+                content = "\n".join(lines)
+            else:
+                content = (
+                    f"Couldn't restore Dream change `{args.split()[0]}`.\n\n"
+                    "It may not exist, or it may be the first saved version with no earlier state to restore."
+                )
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=content, metadata={"render_as": "text"},
+        )
+
     if not git.is_initialized():
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,

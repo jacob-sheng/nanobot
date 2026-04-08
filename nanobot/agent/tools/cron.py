@@ -4,11 +4,41 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 
 
+@tool_parameters(
+    tool_parameters_schema(
+        action=StringSchema("Action to perform", enum=["add", "list", "remove"]),
+        name=StringSchema(
+            "Optional short human-readable label for the job "
+            "(e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message."
+        ),
+        message=StringSchema(
+            "Instruction for the agent to execute when the job triggers "
+            "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report')"
+        ),
+        every_seconds=IntegerSchema(0, description="Interval in seconds (for recurring tasks)"),
+        cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
+        tz=StringSchema(
+            "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). "
+            "When omitted with cron_expr, the tool's default timezone applies."
+        ),
+        at=StringSchema(
+            "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
+            "Naive values use the tool's default timezone."
+        ),
+        deliver=BooleanSchema(
+            description="Whether to deliver the execution result to the user channel (default true)",
+            default=True,
+        ),
+        job_id=StringSchema("Job ID (for remove)"),
+        required=["action"],
+    )
+)
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
@@ -74,6 +104,10 @@ class CronTool(Tool):
                     "enum": ["add", "list", "remove"],
                     "description": "Action to perform",
                 },
+                "name": {
+                    "type": "string",
+                    "description": "Optional short human-readable label for the job",
+                },
                 "message": {"type": "string", "description": "Reminder message (for add)"},
                 "every_seconds": {
                     "type": "integer",
@@ -98,6 +132,10 @@ class CronTool(Tool):
                     ),
                 },
                 "job_id": {"type": "string", "description": "Job ID (for remove)"},
+                "deliver": {
+                    "type": "boolean",
+                    "description": "Whether to deliver the execution result to the user channel",
+                },
                 "send_progress": {
                     "type": "boolean",
                     "description": (
@@ -126,6 +164,7 @@ class CronTool(Tool):
     async def execute(
         self,
         action: str,
+        name: str | None = None,
         message: str = "",
         every_seconds: int | None = None,
         cron_expr: str | None = None,
@@ -142,6 +181,7 @@ class CronTool(Tool):
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
             return self._add_job(
+                name,
                 message,
                 every_seconds,
                 cron_expr,
@@ -160,6 +200,7 @@ class CronTool(Tool):
 
     def _add_job(
         self,
+        name: str | None,
         message: str,
         every_seconds: int | None,
         cron_expr: str | None,
@@ -219,7 +260,7 @@ class CronTool(Tool):
             return "Error: either every_seconds, cron_expr, at, or daily_random_start/end is required"
 
         job = self._cron.add_job(
-            name=message[:30],
+            name=name or message[:30],
             schedule=schedule,
             message=message,
             deliver=deliver,

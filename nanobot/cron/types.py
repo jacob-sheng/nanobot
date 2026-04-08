@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
+CronMemoryPolicy = Literal["durable", "transient"]
+
+
 @dataclass
 class CronSchedule:
     """Schedule definition for a cron job."""
@@ -26,6 +29,8 @@ class CronPayload:
     """What to do when the job runs."""
     kind: Literal["system_event", "agent_turn"] = "agent_turn"
     message: str = ""
+    # Whether session artifacts from this job may enter durable memory pipelines.
+    memory_policy: CronMemoryPolicy = "durable"
     # Deliver response to channel
     deliver: bool = False
     # Whether agent progress updates should be sent to the channel while running

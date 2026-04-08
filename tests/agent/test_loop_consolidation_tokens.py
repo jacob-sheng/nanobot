@@ -41,6 +41,26 @@ async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_process_direct_persists_session_metadata(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+
+    await loop.process_direct(
+        "hello",
+        session_key="cron:test",
+        metadata={
+            "session_metadata": {
+                "memory_policy": "transient",
+                "cron_job_name": "mastodon_daily_share",
+            }
+        },
+    )
+
+    session = loop.sessions.get_or_create("cron:test")
+    assert session.metadata["memory_policy"] == "transient"
+    assert session.metadata["cron_job_name"] == "mastodon_daily_share"
+
+
+@pytest.mark.asyncio
 async def test_prompt_above_threshold_triggers_consolidation(tmp_path, monkeypatch) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
     loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
@@ -56,6 +76,25 @@ async def test_prompt_above_threshold_triggers_consolidation(tmp_path, monkeypat
     await loop.process_direct("hello", session_key="cli:test")
 
     assert loop.consolidator.archive.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_transient_session_skips_durable_history_and_advances_offset(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
+    loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cron:test")
+    session.metadata["memory_policy"] = "transient"
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+    ]
+    loop.sessions.save(session)
+
+    await loop.consolidator.maybe_consolidate_by_tokens(session)
+
+    loop.consolidator.archive.assert_not_awaited()
+    assert session.last_consolidated == len(session.messages)
 
 
 @pytest.mark.asyncio

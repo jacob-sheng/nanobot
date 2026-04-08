@@ -6,13 +6,13 @@ import asyncio
 import re
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -307,10 +307,10 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
 
-        # Add message handler for text, photos, voice, documents
+        # Add message handler for text, photos, voice, documents, and locations
         self._app.add_handler(
             MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
+                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.LOCATION)
                 & ~filters.COMMAND,
                 self._on_message
             )
@@ -816,6 +816,12 @@ class TelegramChannel(BaseChannel):
             content_parts.append(message.text)
         if message.caption:
             content_parts.append(message.caption)
+
+        # Location content
+        if message.location:
+            lat = message.location.latitude
+            lon = message.location.longitude
+            content_parts.append(f"[location: {lat}, {lon}]")
 
         # Download current message media
         current_media_paths, current_media_parts = await self._download_message_media(

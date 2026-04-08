@@ -46,10 +46,42 @@ class _FakeGit:
         return self._revert_result
 
 
-def _make_ctx(raw: str, git: _FakeGit, *, args: str = "", last_dream_cursor: int = 1) -> CommandContext:
+class _FakeDream:
+    def __init__(self, *, batches=None, restore_result=None):
+        self._batches = batches or []
+        self._restore_result = restore_result
+
+    def get_batch(self, identifier: str | None = None):
+        if not self._batches:
+            return None
+        if not identifier:
+            return self._batches[0]
+        ident = identifier.lower()
+        for batch in self._batches:
+            batch_id = str(batch.get("batch_id") or "").lower()
+            commit = str(batch.get("git_commit") or "").lower()
+            if batch_id.startswith(ident) or (commit and commit.startswith(ident)):
+                return batch
+        return None
+
+    def list_batches(self, limit: int = 10):
+        return self._batches[:limit]
+
+    async def restore_batch(self, identifier: str):
+        return self._restore_result
+
+
+def _make_ctx(
+    raw: str,
+    git: _FakeGit,
+    *,
+    args: str = "",
+    last_dream_cursor: int = 1,
+    dream=None,
+) -> CommandContext:
     msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content=raw)
     store = _FakeStore(git, last_dream_cursor=last_dream_cursor)
-    loop = SimpleNamespace(consolidator=SimpleNamespace(store=store))
+    loop = SimpleNamespace(consolidator=SimpleNamespace(store=store), dream=dream)
     return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
 
 
@@ -97,6 +129,38 @@ async def test_dream_log_before_first_run_is_clear() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dream_log_batch_shows_semantic_summary() -> None:
+    commit = CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")
+    diff = (
+        "diff --git a/USER.md b/USER.md\n"
+        "--- a/USER.md\n"
+        "+++ b/USER.md\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    git = _FakeGit(commits=[commit], diff_map={commit.sha: (commit, diff)})
+    dream = _FakeDream(
+        batches=[{
+            "batch_id": "20260406123456-abcd1234",
+            "git_commit": "abcd1234",
+            "created_at": "2026-04-04T12:00:00+08:00",
+            "mem0_actions": [
+                {"op": "update", "memory_id": "mem-1", "old_text": "old", "new_text": "用户常驻上海"},
+                {"op": "delete", "memory_id": "mem-2", "old_text": "verbose dump", "new_text": None},
+            ],
+        }],
+    )
+
+    out = await cmd_dream_log(_make_ctx("/dream-log", git, dream=dream))
+
+    assert "- Semantic memory: 1 updated, 1 deleted" in out.content
+    assert "### Semantic Memory" in out.content
+    assert "UPDATE `mem-1`" in out.content
+    assert "DELETE `mem-2`" in out.content
+
+
+@pytest.mark.asyncio
 async def test_dream_restore_lists_versions_with_next_steps() -> None:
     commits = [
         CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00"),
@@ -141,3 +205,29 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
     assert "- New safety commit: `eeee9999`" in out.content
     assert "- Restored files: `SOUL.md`, `memory/MEMORY.md`" in out.content
     assert "Use `/dream-log eeee9999` to inspect the restore diff." in out.content
+
+
+@pytest.mark.asyncio
+async def test_dream_restore_batch_reports_semantic_rollback() -> None:
+    git = _FakeGit()
+    dream = _FakeDream(
+        restore_result={
+            "batch": {
+                "batch_id": "20260406123456-abcd1234",
+                "git_commit": "abcd1234",
+            },
+            "new_git_sha": "eeee9999",
+            "mem0_actions": [
+                {"op": "delete", "memory_id": "mem-1", "old_text": "用户常驻上海", "new_text": None},
+            ],
+        }
+    )
+
+    out = await cmd_dream_restore(
+        _make_ctx("/dream-restore abcd1234", git, args="abcd1234", dream=dream)
+    )
+
+    assert "Restored Dream memory batch `abcd1234`." in out.content
+    assert "- New safety commit: `eeee9999`" in out.content
+    assert "- Semantic memory rollback: 1 deleted" in out.content
+    assert "DELETE `mem-1`" in out.content

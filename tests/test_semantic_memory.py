@@ -33,12 +33,34 @@ class _FakeMemoryBackend:
     def __init__(self):
         self.add_calls: list[tuple[tuple, dict]] = []
         self.search_calls: list[tuple[tuple, dict]] = []
+        self.get_calls: list[str] = []
+        self.get_all_calls: list[tuple[tuple, dict]] = []
+        self.update_calls: list[tuple[tuple, dict]] = []
+        self.delete_calls: list[tuple[tuple, dict]] = []
+        self.history_calls: list[str] = []
         self.search_result_payload = {
             "results": [
                 {"memory": "User likes jasmine tea", "score": 0.91},
                 {"memory": "User prefers concise answers", "score": 0.78},
             ]
         }
+        self.get_result_payload = {
+            "id": "mem-1",
+            "memory": "User likes jasmine tea",
+            "user_id": "global",
+            "role": "assistant",
+            "metadata": {"source": "history_entry", "category": "preference"},
+        }
+        self.get_all_result_payload = {
+            "results": [self.get_result_payload],
+        }
+        self.history_result_payload = [{"event": "ADD"}]
+        self.embedding_model = SimpleNamespace(embed=lambda text, action=None: [0.1, 0.2])
+        self.vector_store = SimpleNamespace(
+            get=lambda vector_id: None,
+            insert=MagicMock(),
+        )
+        self.db = SimpleNamespace(add_history=MagicMock())
 
     def add(self, *args, **kwargs):
         self.add_calls.append((args, kwargs))
@@ -47,6 +69,26 @@ class _FakeMemoryBackend:
     def search(self, *args, **kwargs):
         self.search_calls.append((args, kwargs))
         return self.search_result_payload
+
+    def get(self, memory_id):
+        self.get_calls.append(memory_id)
+        return self.get_result_payload
+
+    def get_all(self, *args, **kwargs):
+        self.get_all_calls.append((args, kwargs))
+        return self.get_all_result_payload
+
+    def update(self, *args, **kwargs):
+        self.update_calls.append((args, kwargs))
+        return {"message": "updated"}
+
+    def delete(self, *args, **kwargs):
+        self.delete_calls.append((args, kwargs))
+        return {"message": "deleted"}
+
+    def history(self, memory_id):
+        self.history_calls.append(memory_id)
+        return self.history_result_payload
 
 
 def _semantic_config() -> Config:
@@ -202,6 +244,20 @@ async def test_semantic_memory_skips_weather_like_history_entries(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_semantic_memory_skips_curated_share_history_entries(tmp_path, monkeypatch) -> None:
+    backend = _FakeMemoryBackend()
+    monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
+
+    memory = SemanticMemory(_semantic_config().memory, tmp_path)
+    await memory.add_history_entry(
+        "[Scheduled Task] Timer finished. Task 'mastodon_daily_share' has been triggered. "
+        "Use the mastodon-daily-share skill and return exactly NO_SHARE."
+    )
+
+    assert backend.add_calls == []
+
+
+@pytest.mark.asyncio
 async def test_semantic_memory_keeps_durable_history_entries(tmp_path, monkeypatch) -> None:
     backend = _FakeMemoryBackend()
     monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
@@ -213,6 +269,35 @@ async def test_semantic_memory_keeps_durable_history_entries(tmp_path, monkeypat
     add_args, add_kwargs = backend.add_calls[0]
     assert add_args[0] == {"role": "assistant", "content": entry}
     assert add_kwargs["metadata"] == {"source": "history_entry"}
+
+
+@pytest.mark.asyncio
+async def test_semantic_memory_update_preserves_existing_metadata(tmp_path, monkeypatch) -> None:
+    backend = _FakeMemoryBackend()
+    monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
+
+    memory = SemanticMemory(_semantic_config().memory, tmp_path)
+    await memory.update_memory("mem-1", "User likes jasmine tea and concise answers", {"managed_by": "dream"})
+
+    update_args, _ = backend.update_calls[0]
+    assert update_args[0] == "mem-1"
+    assert update_args[1] == "User likes jasmine tea and concise answers"
+    assert update_args[2]["source"] == "history_entry"
+    assert update_args[2]["category"] == "preference"
+    assert update_args[2]["managed_by"] == "dream"
+
+
+@pytest.mark.asyncio
+async def test_semantic_memory_get_all_and_history_wrap_backend(tmp_path, monkeypatch) -> None:
+    backend = _FakeMemoryBackend()
+    monkeypatch.setattr(SemanticMemory, "_build_memory_client", lambda self, cfg: backend)
+
+    memory = SemanticMemory(_semantic_config().memory, tmp_path)
+    items = await memory.get_all_memories(limit=5)
+    history = await memory.memory_history("mem-1")
+
+    assert items[0]["id"] == "mem-1"
+    assert history == [{"event": "ADD"}]
 
 
 def test_semantic_memory_does_not_treat_news_format_preferences_as_volatile() -> None:

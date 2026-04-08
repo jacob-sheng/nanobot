@@ -179,15 +179,20 @@ class CronService:
         self.store_path = store_path
         self.on_job = on_job
         self._store: CronStore | None = None
-        self._last_mtime: float = 0.0
+        self._last_store_sig: tuple[int, int] | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
+
+    @staticmethod
+    def _store_signature(path: Path) -> tuple[int, int]:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
         if self._store and self.store_path.exists():
-            mtime = self.store_path.stat().st_mtime
-            if mtime != self._last_mtime:
+            signature = self._store_signature(self.store_path)
+            if signature != self._last_store_sig:
                 logger.info("Cron: jobs.json modified externally, reloading")
                 self._store = None
         if self._store:
@@ -214,6 +219,7 @@ class CronService:
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
                             message=j["payload"].get("message", ""),
+                            memory_policy=j["payload"].get("memoryPolicy", "durable"),
                             deliver=j["payload"].get("deliver", False),
                             send_progress=j["payload"].get("sendProgress", True),
                             mirror_weixin_allowfrom=j["payload"].get("mirrorWeixinAllowFrom", False),
@@ -240,6 +246,7 @@ class CronService:
                         delete_after_run=j.get("deleteAfterRun", False),
                     ))
                 self._store = CronStore(jobs=jobs)
+                self._last_store_sig = self._store_signature(self.store_path)
             except Exception as e:
                 logger.warning("Failed to load cron store: {}", e)
                 self._store = CronStore()
@@ -274,6 +281,7 @@ class CronService:
                     "payload": {
                         "kind": j.payload.kind,
                         "message": j.payload.message,
+                        "memoryPolicy": j.payload.memory_policy,
                         "deliver": j.payload.deliver,
                         "sendProgress": j.payload.send_progress,
                         "mirrorWeixinAllowFrom": j.payload.mirror_weixin_allowfrom,
@@ -304,8 +312,8 @@ class CronService:
         }
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        self._last_mtime = self.store_path.stat().st_mtime
-    
+        self._last_store_sig = self._store_signature(self.store_path)
+
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
@@ -433,6 +441,7 @@ class CronService:
         name: str,
         schedule: CronSchedule,
         message: str,
+        memory_policy: str = "durable",
         deliver: bool = False,
         send_progress: bool = True,
         mirror_weixin_allowfrom: bool = False,
@@ -453,6 +462,7 @@ class CronService:
             payload=CronPayload(
                 kind="agent_turn",
                 message=message,
+                memory_policy=memory_policy,
                 deliver=deliver,
                 send_progress=send_progress,
                 mirror_weixin_allowfrom=mirror_weixin_allowfrom,

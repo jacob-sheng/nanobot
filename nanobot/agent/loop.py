@@ -293,6 +293,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            semantic_memory=self.semantic_memory,
         )
         self._register_default_tools()
         self.commands = CommandRouter()
@@ -427,14 +428,10 @@ class AgentLoop:
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
-        """Format tool calls as concise hint, e.g. 'web_search("query")'."""
-        def _fmt(tc):
-            args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
-            val = next(iter(args.values()), None) if isinstance(args, dict) else None
-            if not isinstance(val, str):
-                return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
-        return ", ".join(_fmt(tc) for tc in tool_calls)
+        """Format tool calls as concise hints with smart abbreviation."""
+        from nanobot.utils.tool_hints import format_tool_hints
+
+        return format_tool_hints(tool_calls)
 
     @staticmethod
     def _extract_guard_reason(messages: list[dict]) -> str | None:
@@ -750,6 +747,7 @@ class AgentLoop:
         session = self.sessions.get_or_create(key)
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
+        self._merge_session_metadata(session, msg)
 
         # Slash commands
         raw = msg.content.strip()
@@ -939,6 +937,22 @@ class AgentLoop:
         session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
         self.sessions.save(session)
 
+    @staticmethod
+    def _merge_session_metadata(session: Session, msg: InboundMessage) -> None:
+        """Apply session-scoped metadata sent alongside the inbound message."""
+        payload = msg.metadata.get("session_metadata")
+        if not isinstance(payload, dict) or not payload:
+            return
+
+        changed = False
+        for key, value in payload.items():
+            if session.metadata.get(key) == value:
+                continue
+            session.metadata[key] = value
+            changed = True
+        if changed:
+            session.updated_at = datetime.now()
+
     def _clear_runtime_checkpoint(self, session: Session) -> None:
         if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
             session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
@@ -1010,6 +1024,7 @@ class AgentLoop:
         self,
         content: str,
         session_key: str = "cli:direct",
+        metadata: dict[str, Any] | None = None,
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
@@ -1018,7 +1033,13 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            metadata=dict(metadata or {}),
+        )
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
             on_stream=on_stream, on_stream_end=on_stream_end,
