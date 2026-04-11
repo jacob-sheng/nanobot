@@ -1,6 +1,6 @@
 ## Local Maintenance Notes
 
-Last updated: 2026-03-27
+Last updated: 2026-04-11
 
 This file tracks local behavior that intentionally diverges from upstream so future upgrades can preserve it.
 
@@ -39,14 +39,19 @@ Key files to re-check after every upstream merge:
 - `nanobot/agent/context.py`
 - `nanobot/agent/loop.py`
 - `nanobot/agent/memory.py`
+- `nanobot/agent/runner.py`
 - `nanobot/agent/semantic_memory.py`
 - `nanobot/agent/tools/semantic_memory.py`
+- `nanobot/channels/telegram.py`
 - `nanobot/channels/weixin.py`
+- `nanobot/cli/commands.py`
+- `nanobot/cron/service.py`
 - `nanobot/utils/weixin_broadcast.py`
 - `nanobot/utils/weixin_state_migration.py`
 - `nanobot/config/schema.py`
 - `nanobot/skills/memory/SKILL.md`
 - `tests/test_semantic_memory.py`
+- `tests/channels/test_telegram_channel.py`
 - `tests/channels/test_weixin_channel.py`
 
 ### Related Local Changes Outside This Repo
@@ -125,6 +130,29 @@ Key files to re-check after every upstream merge:
   - `nanobot-gateway`
   - `codex-listener`
 
+### 2026-04-11 Upstream Merge Record
+
+- Current upstream merge target:
+  - `origin/main` at `9bccfa6`
+- Local integration branch used for conflict resolution:
+  - `integrate-20260411-origin-main`
+- This upgrade intentionally switched away from blanket `-X ours`.
+- Current merge policy:
+  - merge-based upgrade with manual conflict resolution
+  - preserve the local memory / provider / Weixin / curated-share behavior listed above
+  - absorb upstream runtime correctness, cron, tool-hint, websocket, unified-session, and Telegram transport fixes where they do not change local defaults
+- Highest-risk overlap areas in this cycle:
+  - `nanobot/agent/loop.py`
+  - `nanobot/agent/memory.py`
+  - `nanobot/agent/runner.py`
+  - `nanobot/channels/telegram.py`
+  - `nanobot/cli/commands.py`
+  - `nanobot/config/schema.py`
+  - `nanobot/cron/service.py`
+  - `nanobot/utils/helpers.py`
+  - `tests/agent/test_unified_session.py`
+  - `tests/cron/test_cron_service.py`
+
 ### 2026-03-24 Backup And Update Record
 
 - Runtime backup directory:
@@ -162,4 +190,4 @@ Upstream merge targets:
 
 Merge policy:
 
-- local-preferred merge using `git merge -X ours`
+- retired after the 2026-04-11 upstream merge
