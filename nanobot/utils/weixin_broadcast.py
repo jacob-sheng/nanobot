@@ -4,29 +4,48 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+import httpx
+
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.weixin import WeixinChannel, WeixinConfig
 
 DEFAULT_CONFIG_PATH = Path.home() / ".nanobot" / "config.json"
 DEFAULT_TIMEOUT = 30
 
 
-@dataclass(frozen=True)
+@dataclass
 class WeixinBroadcastTargets:
-    """Resolved bridge target set for allowFrom broadcasts."""
+    """Resolved direct-channel target set for allowFrom broadcasts."""
 
-    bridge_url: str = ""
-    bridge_token: str = ""
+    base_url: str = ""
+    token: str = ""
+    route_tag: str | int | None = None
+    state_path: Path | None = None
     recipients: tuple[str, ...] = ()
+    context_tokens: dict[str, str] = field(default_factory=dict)
 
 
 def strip_basic_markdown(text: str) -> str:
-    """Strip the small markdown subset our bridge recipients should not see."""
+    """Strip the small markdown subset our direct-channel recipients should not see."""
     return text.replace("*", "").replace("_", "").replace("`", "")
 
 
+def _normalize_context_tokens(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(user_id).strip(): str(token).strip()
+        for user_id, token in value.items()
+        if str(user_id).strip() and str(token).strip()
+    }
+
+
 def resolve_weixin_allowfrom_targets(config_path: Path = DEFAULT_CONFIG_PATH) -> WeixinBroadcastTargets:
-    """Resolve current Weixin bridge recipients from config and saved account state."""
+    """Resolve current Weixin direct-channel recipients from config and saved state."""
     if not config_path.exists():
         return WeixinBroadcastTargets()
 
@@ -39,34 +58,29 @@ def resolve_weixin_allowfrom_targets(config_path: Path = DEFAULT_CONFIG_PATH) ->
     if not weixin_cfg.get("enabled"):
         return WeixinBroadcastTargets()
 
-    bridge_url = str(weixin_cfg.get("bridgeUrl") or "").strip()
-    bridge_token = str(weixin_cfg.get("bridgeToken") or "").strip()
     allow_from = [
         str(item).strip()
         for item in weixin_cfg.get("allowFrom", [])
         if str(item).strip() and str(item).strip() != "*"
     ]
-    state_dir = Path(str(weixin_cfg.get("stateDir") or (Path.home() / ".nanobot" / "weixin-auth")))
-    accounts_dir = state_dir / "accounts"
+    state_dir = Path(str(weixin_cfg.get("stateDir") or (Path.home() / ".nanobot" / "weixin")))
+    state_path = state_dir / "account.json"
 
-    recipients: list[str] = []
-    if accounts_dir.exists():
-        for account_file in sorted(accounts_dir.glob("*.json")):
-            try:
-                account = json.loads(account_file.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            account_id = str(account.get("accountId") or "").strip()
-            if not account_id:
-                continue
-            for user_id in allow_from:
-                recipients.append(f"{account_id}|{user_id}")
+    state: dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
 
-    deduped = tuple(dict.fromkeys(recipients))
+    recipients = tuple(dict.fromkeys(allow_from))
     return WeixinBroadcastTargets(
-        bridge_url=bridge_url,
-        bridge_token=bridge_token,
-        recipients=deduped,
+        base_url=str(weixin_cfg.get("baseUrl") or state.get("base_url") or "https://ilinkai.weixin.qq.com").strip(),
+        token=str(weixin_cfg.get("token") or state.get("token") or "").strip(),
+        route_tag=weixin_cfg.get("routeTag"),
+        state_path=state_path,
+        recipients=recipients,
+        context_tokens=_normalize_context_tokens(state.get("context_tokens")),
     )
 
 
@@ -79,46 +93,42 @@ async def send_weixin_broadcast_async(
 ) -> dict[str, str]:
     """Broadcast one text payload to all current allowFrom targets."""
     targets = targets or resolve_weixin_allowfrom_targets(config_path)
-    if not targets.bridge_url or not targets.recipients:
+    if not targets.base_url or not targets.token or not targets.recipients:
         return {}
-
-    import websockets
 
     plain_text = strip_basic_markdown(text)
     results: dict[str, str] = {}
-
-    async with websockets.connect(
-        targets.bridge_url,
-        open_timeout=timeout,
-        close_timeout=timeout,
-    ) as ws:
-        if targets.bridge_token:
-            await ws.send(json.dumps({"type": "auth", "token": targets.bridge_token}, ensure_ascii=False))
-
+    channel = WeixinChannel(
+        WeixinConfig(
+            enabled=True,
+            allow_from=["*"],
+            base_url=targets.base_url,
+            route_tag=targets.route_tag,
+            state_dir=str(targets.state_path.parent) if targets.state_path else "",
+        ),
+        MessageBus(),
+    )
+    channel._token = targets.token
+    channel._context_tokens = dict(targets.context_tokens)
+    channel._client = httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout, connect=min(timeout, 30)),
+        follow_redirects=True,
+    )
+    try:
         for recipient in targets.recipients:
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "send",
-                        "to": recipient,
-                        "text": plain_text,
-                        "media": [],
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            while True:
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                message = json.loads(raw)
-                msg_type = message.get("type")
-                if msg_type == "heartbeat":
-                    continue
-                if msg_type == "sent" and message.get("to") == recipient:
-                    results[recipient] = "sent"
-                    break
-                if msg_type == "error":
-                    results[recipient] = f"error: {message.get('error', 'unknown')}"
-                    break
+            context_token = targets.context_tokens.get(recipient, "").strip()
+            if not context_token:
+                results[recipient] = "missing_context_token"
+                continue
+            try:
+                await channel._send_text(recipient, plain_text, context_token)
+            except Exception as exc:
+                results[recipient] = f"error: {exc}"
+            else:
+                results[recipient] = "sent"
+    finally:
+        await channel._client.aclose()
+        channel._client = None
 
     return results
 

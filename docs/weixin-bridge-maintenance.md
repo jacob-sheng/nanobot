@@ -1,104 +1,82 @@
-# Weixin Bridge Maintenance
+# Weixin Direct-Channel Maintenance
 
-This environment intentionally keeps a local Node-based Weixin bridge instead of
-switching back to upstream's direct HTTP long-poll channel.
+This environment now follows upstream's direct HTTP long-poll Weixin channel.
+There is no standalone Weixin bridge service anymore.
 
 ## Current Architecture
 
-- Python runtime channel:
+- Runtime channel:
   - `nanobot/channels/weixin.py`
-- Node bridge runtime:
-  - `bridge/src/weixin-api.ts`
-  - `bridge/src/weixin-auth.ts`
-  - `bridge/src/weixin-index.ts`
-  - `bridge/src/weixin.ts`
-- Persistent auth / bridge state:
-  - `~/.nanobot/weixin-auth/accounts/*.json`
-  - `~/.nanobot/weixin-auth/sync/*.json`
-- Long-running host:
-  - `nanobot-weixin-bridge.service`
+- Weixin mirror helper:
+  - `nanobot/utils/weixin_broadcast.py`
+- Legacy state migration:
+  - `nanobot/utils/weixin_state_migration.py`
+  - `scripts/migrate_weixin_state.py`
+- Persistent direct-channel state:
+  - `~/.nanobot/weixin/account.json`
+- Legacy migration source kept for rollback only:
+  - `~/.nanobot/weixin-auth/`
 
-The bridge owns:
+The direct channel owns:
 
 - QR login
-- polling and error classification
-- `contextTokens` routing state
-- inbound media download
-- outbound media upload / send
+- long-poll receive loop
+- `context_tokens` persistence
+- typing ticket cache
+- inbound media download and decrypt
+- outbound media upload and send
 
-The Python channel owns:
-
-- websocket transport to the bridge
-- `InboundMessage` creation
-- prompt-safe metadata filtering
-- heartbeat timeout handling
+Conversation text history is **not** stored in Weixin state; it lives under
+`~/.nanobot/workspace/sessions/`.
 
 ## State Files
 
-- `accounts/*.json`
-  - stores account token, user/account IDs, base URL, and persisted `contextTokens`
-- `sync/*.json`
-  - stores `getUpdatesBuf`
-
-Conversation text history is **not** stored in `weixin-auth`; it lives under
-`~/.nanobot/workspace/sessions/`.
-
-## Upstream Weixin Fixes Worth Re-checking
-
-When upstream `HKUDS/nanobot` changes Weixin support, re-check these areas first:
-
-- `3a9d6ea` route tag / `SKRouteTag` compatibility
-- `1f5492e` persisted context tokens
-- `9c872c3` session expired / invalid session retry behavior
-- `48902ae` QR auto-refresh
-- `11e1bbb` outbound media send via CDN upload
-- `0dad612` / `0ccfcf6` version migration and compatibility updates
+- `~/.nanobot/weixin/account.json`
+  - stores `token`, `get_updates_buf`, persisted `context_tokens`, `typing_tickets`, and `base_url`
+- `~/.nanobot/weixin-auth/`
+  - legacy bridge-era backup material used only by the migration script
 
 ## Local Guarantees To Preserve
 
-- keep the bridge architecture; do not swap in upstream direct Weixin without a dedicated migration
+- keep the upstream direct-channel architecture; do not reintroduce a standalone Weixin bridge
 - do not expose transport-only metadata like `context_token` to prompt construction
 - keep the shared "inject current time only after 10 minutes of idle" policy for chat channels, with Weixin participating in the same idle-gap hint behavior
-- keep QR refresh writing `~/weixin-qr.png`
-- keep bridge restart behavior compatible with `~/.nanobot/weixin-auth`
-- keep inbound image parsing aligned with Tencent's `@tencent-weixin/openclaw-weixin` plugin:
+- keep direct state under `~/.nanobot/weixin/account.json`
+- keep `mirrorWeixinAllowFrom` working for daily digest and curated cron shares via `channels.weixin.allowFrom`
+- keep inbound image parsing aligned with Tencent's `@tencent-weixin/openclaw-weixin` semantics:
   - parse `item_list`
-  - match `type=IMAGE`
-  - read `image_item.media.encrypt_query_param`
-  - decrypt CDN bytes with `image_item.aeskey` or `image_item.media.aes_key`
-  - do not treat "image URL scraping" as the primary path
+  - match typed media items
+  - prefer `image_item.aeskey` for images and `media.aes_key` elsewhere
+  - use CDN `encrypt_query_param` / `full_url`
 
 ## Troubleshooting
 
-- Bridge connected but replies fail:
-  - inspect `contextTokens` in `accounts/*.json`
-  - inspect `journalctl -u nanobot-weixin-bridge.service`
-  - look for `weixin.send_invalid_context_token` or `weixin.send_session_expired`
-- Polling noise / silence:
-  - inspect `sync/*.json`
-  - inspect `weixin.monitor_session_expired`, `weixin.monitor_api_error`, `weixin.monitor_network_error`
-- Inbound images not reaching the model:
-  - inspect `journalctl -u nanobot-weixin-bridge.service`
-  - look for `weixin.inbound_item_summary`, `weixin.image_download_start`, `weixin.image_saved`, `weixin.image_download_failed`
-  - if `~/.nanobot/media/weixin/` stays empty, the bridge has not completed CDN download/decrypt yet
-  - compare the current `item_list` structure against Tencent's official `@tencent-weixin/openclaw-weixin` plugin before changing parsing logic
-- Gateway says bridge disconnected:
+- Login or polling fails:
   - inspect `journalctl -u nanobot-gateway.service`
-  - inspect heartbeat events and websocket close reasons
+  - look for `WeChat login failed`, `getUpdates failed`, or session-expired warnings
+- Replies are skipped:
+  - inspect `~/.nanobot/weixin/account.json`
+  - confirm `context_tokens` contains the target `allowFrom` user
+  - if the recipient is missing a token, direct mirrors intentionally report `missing_context_token`
+- Inbound images do not reach the model:
+  - inspect `journalctl -u nanobot-gateway.service`
+  - look for `WeChat media download failed` or `WeChat inbound`
+  - if `~/.nanobot/media/weixin/` stays empty, the direct channel has not completed download/decrypt yet
+- Legacy state must be converted:
+  - run `scripts/migrate_weixin_state.py`
+  - verify `~/.nanobot/weixin/account.json` exists before restarting the gateway
 
 ## Upgrade Checklist
 
-1. Review upstream Weixin commits against the files listed above.
-2. Port only behavior that fits the local bridge architecture.
-3. Rebuild `~/.nanobot/bridge`.
-4. Run focused Weixin tests plus bridge build.
-5. Restart:
-   - `nanobot-weixin-bridge.service`
-   - `nanobot-gateway.service`
-6. Verify:
+1. Review upstream Weixin commits in `nanobot/channels/weixin.py`.
+2. Re-check local helpers:
+   - `nanobot/utils/weixin_broadcast.py`
+   - `nanobot/utils/weixin_state_migration.py`
+3. Run focused Weixin tests.
+4. Restart `nanobot-gateway.service`.
+5. Verify:
    - text send/receive
    - inbound image forwarding
    - outbound media send
-   - QR refresh
-   - restart continuity via persisted `contextTokens`
-    - daily digest Weixin broadcast still works via `channels.weixin.allowFrom`
+   - QR login still works via `nanobot channels login weixin`
+   - daily digest Weixin mirror still works via `channels.weixin.allowFrom`

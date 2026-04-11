@@ -8,7 +8,6 @@ from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import (
-    _finalize_weixin_login_state,
     _handle_curated_daily_share_response,
     _make_provider,
     app,
@@ -17,6 +16,7 @@ from nanobot.config.schema import Config
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
+from nanobot.utils.weixin_state_migration import migrate_legacy_weixin_state
 
 runner = CliRunner()
 
@@ -205,37 +205,50 @@ def test_onboard_wizard_preserves_explicit_config_in_next_steps(tmp_path, monkey
     assert f"nanobot gateway --config {resolved_config}" in compact_output
 
 
-def test_finalize_weixin_login_state_updates_config(tmp_path):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
+def test_weixin_state_migration_creates_direct_account_json(tmp_path: Path) -> None:
+    legacy_dir = tmp_path / "weixin-auth"
+    accounts_dir = legacy_dir / "accounts"
+    sync_dir = legacy_dir / "sync"
+    accounts_dir.mkdir(parents=True)
+    sync_dir.mkdir(parents=True)
+
+    (accounts_dir / "acct-1.json").write_text(
         json.dumps(
             {
-                "channels": {
-                    "telegram_planbridge": {
-                        "enabled": True,
-                        "allowFrom": ["6682937110"],
-                    }
-                }
+                "accountId": "acct-1",
+                "token": "bot-token",
+                "baseUrl": "https://ilinkai.weixin.qq.com",
+                "contextTokens": {"wx-user": "ctx-1"},
             }
         ),
         encoding="utf-8",
     )
-
-    state_dir = tmp_path / "weixin-auth"
-    updated = _finalize_weixin_login_state(
-        config_path=config_path,
-        user_id="wx_user@im.wechat",
-        base_url="https://ilinkai.weixin.qq.com",
-        state_dir=state_dir,
+    (sync_dir / "acct-1.json").write_text(
+        json.dumps({"getUpdatesBuf": "cursor-1"}),
+        encoding="utf-8",
     )
 
-    assert updated == config_path
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    assert raw["channels"]["telegram_planbridge"]["enabled"] is True
-    assert raw["channels"]["weixin"]["enabled"] is True
-    assert raw["channels"]["weixin"]["bridgeUrl"] == "ws://127.0.0.1:3002"
-    assert raw["channels"]["weixin"]["allowFrom"] == ["wx_user@im.wechat"]
-    assert raw["channels"]["weixin"]["stateDir"] == str(state_dir)
+    result = migrate_legacy_weixin_state(legacy_dir, tmp_path / "weixin")
+
+    assert result.account_id == "acct-1"
+    payload = json.loads(result.state_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "token": "bot-token",
+        "get_updates_buf": "cursor-1",
+        "context_tokens": {"wx-user": "ctx-1"},
+        "typing_tickets": {},
+        "base_url": "https://ilinkai.weixin.qq.com",
+    }
+
+
+def test_weixin_state_migration_rejects_multiple_accounts(tmp_path: Path) -> None:
+    accounts_dir = tmp_path / "weixin-auth" / "accounts"
+    accounts_dir.mkdir(parents=True)
+    (accounts_dir / "acct-1.json").write_text("{}", encoding="utf-8")
+    (accounts_dir / "acct-2.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="exactly one legacy Weixin account"):
+        migrate_legacy_weixin_state(tmp_path / "weixin-auth", tmp_path / "weixin")
 
 
 @pytest.mark.asyncio

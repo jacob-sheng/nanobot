@@ -25,12 +25,11 @@ This file tracks local behavior that intentionally diverges from upstream so fut
 - Local `pyproject.toml` keeps the Mem0 runtime dependencies so rebuilds and restore flows do not silently drop semantic memory support.
 - Chat channels (`weixin`, `telegram`, `telegram_planbridge`) now only inject runtime time after 10 minutes of idle, and include a human-readable idle-gap hint once that threshold is crossed.
 - Switched the default chat provider to the AxonHub OpenAI-compatible endpoint using `provider=custom`, model `ollama/kimi-k2.5`, and base URL `https://axon.061609.xyz/v1`.
-- Added a local Weixin bridge channel backed by `nanobot/channels/weixin.py` and `bridge/src/weixin*.ts`.
-- Weixin login/runtime state lives under `~/.nanobot/weixin-auth`, with `nanobot-weixin-bridge.service` as the long-running bridge host.
-- This local Weixin path intentionally diverges from upstream's direct HTTP long-poll channel. Keep the bridge architecture and selectively port upstream Weixin fixes instead of replacing it wholesale.
-- Local inbound image parsing is intentionally aligned with Tencent's official `@tencent-weixin/openclaw-weixin` plugin: read `item_list` typed media, use `image_item.media.encrypt_query_param`, and decrypt CDN bytes with `image_item.aeskey` / `image_item.media.aes_key` instead of relying on image-URL discovery.
+- Kept Weixin on upstream's direct HTTP long-poll channel and removed the standalone bridge runtime from the local stack.
+- Weixin runtime state now lives under `~/.nanobot/weixin/account.json`; legacy `~/.nanobot/weixin-auth` is retained only as a migration/rollback source.
+- Added `nanobot/utils/weixin_state_migration.py` plus `scripts/migrate_weixin_state.py` to convert one saved legacy bridge account into direct-channel state.
 - Added `mirrorWeixinAllowFrom` as a local cron payload field so curated background shares can keep Telegram as the primary target while best-effort mirroring the same final text to current `channels.weixin.allowFrom`.
-- Extracted the Weixin allowFrom broadcast path into `nanobot/utils/weixin_broadcast.py`, shared by both the daily digest service and curated cron share callbacks.
+- Extracted the Weixin allowFrom broadcast path into `nanobot/utils/weixin_broadcast.py`, shared by both the daily digest service and curated cron share callbacks, now using direct-channel `account.json` plus persisted `context_tokens`.
 - Added a local `bilibili_daily_share` content-source integration backed by `~/.nanobot/workspace/skills/bilibili-daily-share/`, login state in `~/.nanobot/bilibili-auth/`, and a dedicated `~/.nanobot/venvs/bilibili-cli` runtime pinned to `bilibili-api-python==17.4.1`.
 - The Bilibili daily share path intentionally uses logged-in homepage recommendations rather than any public hot list, and only sends Telegram login reminders when auth expires.
 - Curated Mastodon share marking keeps a local fallback path that can extract canonical status IDs directly from the final response URL when `last_prepare.json` is missing.
@@ -43,10 +42,8 @@ Key files to re-check after every upstream merge:
 - `nanobot/agent/semantic_memory.py`
 - `nanobot/agent/tools/semantic_memory.py`
 - `nanobot/channels/weixin.py`
-- `bridge/src/weixin-api.ts`
-- `bridge/src/weixin-auth.ts`
-- `bridge/src/weixin-index.ts`
-- `bridge/src/weixin.ts`
+- `nanobot/utils/weixin_broadcast.py`
+- `nanobot/utils/weixin_state_migration.py`
 - `nanobot/config/schema.py`
 - `nanobot/skills/memory/SKILL.md`
 - `tests/test_semantic_memory.py`
@@ -62,16 +59,15 @@ Key files to re-check after every upstream merge:
 - Curated random social shares also use the same Weixin allowFrom broadcast helper, but only for their final share text and never for progress updates or Bilibili login reminders.
 - Service-level provider secrets live in:
   - `/etc/default/nanobot`
-- Weixin bridge service unit lives in:
-  - `/etc/systemd/system/nanobot-weixin-bridge.service`
-- Weixin bridge maintenance notes live in:
+- Weixin maintenance notes live in:
   - `docs/weixin-bridge-maintenance.md`
 - Current external secret files in the home directory:
   - `~/NIM.key` for NVIDIA NIM embeddings
   - `~/OLLAMA_CLOUD.key` as the archived retired Ollama Cloud key
   - `~/axonhub.key` for the active AxonHub API key
 - Current local auth state directories in the home directory:
-  - `~/.nanobot/weixin-auth`
+  - `~/.nanobot/weixin`
+  - `~/.nanobot/weixin-auth` (legacy migration source only)
   - `~/.nanobot/bilibili-auth`
   - `~/.config/toot`
 
@@ -116,9 +112,10 @@ Key files to re-check after every upstream merge:
 - Verify curated random shares still only send final text, never progress, while mirroring to Weixin when `mirrorWeixinAllowFrom=true`.
 - Verify `bilibili_daily_share` still reads logged-in homepage recommendations, keeps `last_prepare.json` in sync with callback matching, and only emits Telegram login reminders on auth expiry.
 - Verify `~/.nanobot/workspace/skills/Codex-Listener` still resolves to the listener repo.
-- Verify the local Weixin bridge still preserves:
-  - `contextTokens` persistence inside `~/.nanobot/weixin-auth/accounts/*.json`
-  - session-expired / invalid-context handling without noisy retry loops
+- Verify the local Weixin direct channel still preserves:
+  - `context_tokens` persistence inside `~/.nanobot/weixin/account.json`
+  - legacy state migration from `~/.nanobot/weixin-auth`
+  - session-expired handling without noisy retry loops
   - optional `routeTag` compatibility for ilinkai 1.0.3+
   - QR refresh behavior
   - inbound image parsing via Tencent official `item_list + CDN decrypt` semantics
@@ -126,7 +123,6 @@ Key files to re-check after every upstream merge:
 - Re-run the focused test suite before restarting services.
 - Restart and check:
   - `nanobot-gateway`
-  - `nanobot-weixin-bridge`
   - `codex-listener`
 
 ### 2026-03-24 Backup And Update Record

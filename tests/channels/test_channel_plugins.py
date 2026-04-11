@@ -208,7 +208,7 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
             seen["config"] = self.config
             return True
 
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: Config())
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: Config())
     monkeypatch.setattr(
         "nanobot.channels.registry.discover_all",
         lambda: {"fakeplugin": _LoginPlugin},
@@ -271,10 +271,11 @@ def test_weixin_channel_default_config_and_init():
 
     cfg = WeixinChannel.default_config()
     assert cfg["enabled"] is False
-    assert cfg["bridgeUrl"] == "ws://127.0.0.1:3002"
+    assert cfg["baseUrl"] == "https://ilinkai.weixin.qq.com"
+    assert cfg["pollTimeout"] == 35
 
     ch = WeixinChannel({"enabled": False, "allowFrom": ["*"]}, MessageBus())
-    assert ch.config.bridge_url == "ws://127.0.0.1:3002"
+    assert ch.config.base_url == "https://ilinkai.weixin.qq.com"
     assert ch.config.allow_from == ["*"]
 
 
