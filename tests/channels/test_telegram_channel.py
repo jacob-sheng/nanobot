@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,7 +17,12 @@ from telegram.error import RetryAfter
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.telegram import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramChannel, _StreamBuf
+from nanobot.channels.telegram import (
+    TELEGRAM_REPLY_CONTEXT_MAX_LEN,
+    PendingSend,
+    TelegramChannel,
+    _StreamBuf,
+)
 from nanobot.channels.telegram import TelegramConfig
 
 
@@ -34,9 +41,14 @@ class _FakeHTTPXRequest:
 class _FakeUpdater:
     def __init__(self, on_start_polling) -> None:
         self._on_start_polling = on_start_polling
+        self.poll_kwargs = None
 
     async def start_polling(self, **kwargs) -> None:
+        self.poll_kwargs = kwargs
         self._on_start_polling()
+
+    async def stop(self) -> None:
+        pass
 
 
 class _FakeBot:
@@ -95,6 +107,12 @@ class _FakeApp:
         pass
 
     async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
         pass
 
 
@@ -223,6 +241,37 @@ async def test_start_respects_custom_pool_config(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_respects_retry_config_and_drop_pending_updates(monkeypatch, tmp_path: Path) -> None:
+    _FakeHTTPXRequest.clear()
+    config = TelegramConfig(
+        enabled=True,
+        token="123:abc",
+        allow_from=["*"],
+        drop_pending_updates=False,
+        send_retry_enabled=True,
+        send_retry_heartbeat_seconds=12,
+        send_retry_outbox_path=str(tmp_path / "telegram-outbox.json"),
+    )
+    bus = MessageBus()
+    channel = TelegramChannel(config, bus)
+    app = _FakeApp(lambda: setattr(channel, "_running", False))
+    builder = _FakeBuilder(app)
+
+    monkeypatch.setattr("nanobot.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.Application",
+        SimpleNamespace(builder=lambda: builder),
+    )
+
+    await channel.start()
+
+    assert app.updater.poll_kwargs["drop_pending_updates"] is False
+    assert channel._retry_task is not None
+    assert channel._heartbeat_task is not None
+    await channel.stop()
+
+
+@pytest.mark.asyncio
 async def test_send_text_retries_on_timeout() -> None:
     """_send_text retries on TimedOut before succeeding."""
     from telegram.error import TimedOut
@@ -280,6 +329,81 @@ async def test_send_text_retries_on_retry_after() -> None:
 
     assert call_count == 2
     assert len(channel._app.bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_queues_retryable_failure_and_flushes_outbox(tmp_path: Path) -> None:
+    from telegram.error import NetworkError
+
+    config = TelegramConfig(
+        enabled=True,
+        token="123:abc",
+        allow_from=["*"],
+        send_retry_enabled=True,
+        send_retry_initial_seconds=1,
+        send_retry_outbox_path=str(tmp_path / "telegram-outbox.json"),
+    )
+    channel = TelegramChannel(config, MessageBus())
+    channel._app = _FakeApp(lambda: None)
+    channel._running = True
+
+    attempts = {"count": 0}
+
+    async def flaky_send(**kwargs):
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise NetworkError("proxy down")
+        return await _FakeBot.send_message(channel._app.bot, **kwargs)
+
+    channel._app.bot.send_message = flaky_send
+
+    await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="hello"))
+
+    assert len(channel._outbox) == 1
+    saved = json.loads((tmp_path / "telegram-outbox.json").read_text(encoding="utf-8"))
+    assert saved[0]["chat_id"] == "123"
+
+    channel._outbox[0].next_retry_at = 0
+    await channel._flush_outbox(force=True)
+
+    assert channel._outbox == []
+    assert attempts["count"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_deliver_pending_preserves_remainder_after_partial_media_failure() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    async def fake_send_media_item(chat_id, media_path, reply_params, thread_kwargs):
+        if media_path.endswith("first.jpg"):
+            return None
+        raise RetryAfter(retry_after=1)
+
+    channel._send_media_item = fake_send_media_item
+    pending = PendingSend(
+        message_id="m1",
+        chat_id="123",
+        text="hello",
+        media=["/tmp/first.jpg", "/tmp/second.jpg"],
+        parse_mode="HTML",
+        reply_to_message_id=None,
+        message_thread_id=None,
+        created_at=time.time(),
+        attempts=0,
+        next_retry_at=time.time(),
+        last_error="",
+    )
+
+    remainder, error = await channel._deliver_pending(pending)
+
+    assert isinstance(error, RetryAfter)
+    assert remainder is not None
+    assert remainder.media == ["/tmp/second.jpg"]
+    assert remainder.text == "hello"
 
 
 @pytest.mark.asyncio

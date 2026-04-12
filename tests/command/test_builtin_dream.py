@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from nanobot.bus.events import InboundMessage
-from nanobot.command.builtin import cmd_dream_log, cmd_dream_restore
-from nanobot.command.router import CommandContext
+from nanobot.command.builtin import cmd_dream_log, cmd_dream_restore, register_builtin_commands
+from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.utils.gitstore import CommitInfo
 
 
@@ -231,3 +231,30 @@ async def test_dream_restore_batch_reports_semantic_rollback() -> None:
     assert "- New safety commit: `eeee9999`" in out.content
     assert "- Semantic memory rollback: 1 deleted" in out.content
     assert "DELETE `mem-1`" in out.content
+
+
+@pytest.mark.asyncio
+async def test_builtin_router_accepts_dream_log_underscore_alias() -> None:
+    commit = CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")
+    diff = "diff --git a/SOUL.md b/SOUL.md\n"
+    git = _FakeGit(commits=[commit], diff_map={commit.sha: (commit, diff)})
+    router = CommandRouter()
+    register_builtin_commands(router)
+
+    out = await router.dispatch(_make_ctx("/dream_log", git))
+
+    assert out is not None
+    assert "Dream Update" in out.content
+
+
+@pytest.mark.asyncio
+async def test_builtin_router_accepts_dream_restore_underscore_alias() -> None:
+    commits = [CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")]
+    git = _FakeGit(commits=commits)
+    router = CommandRouter()
+    register_builtin_commands(router)
+
+    out = await router.dispatch(_make_ctx("/dream_restore", git))
+
+    assert out is not None
+    assert "Dream Restore" in out.content
